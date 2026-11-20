@@ -93,6 +93,33 @@ ApplicationWindow {
     Component.onCompleted: begin()
     onUsableChanged: begin()
 
+    // The media keys, playerctl and the bar play along over MPRIS. Play does
+    // as Space does: with nothing playing it plays the genre the keyboard is
+    // on, and after trouble it tries again.
+    Binding { target: backend.mpris; property: "paused"; value: win.paused }
+    Binding { target: backend.mpris; property: "position"; value: win.player ? win.player.position : 0 }
+    Binding { target: backend.mpris; property: "duration"; value: win.player ? win.player.duration : 0 }
+    Connections {
+        target: backend.mpris
+        function onPauseAsked(paused) {
+            if (!paused && win.flow.genre !== "" && (win.blocked || win.flow.error !== ""))
+                win.again()
+            else if (win.flow.genre !== "")
+                win.paused = paused
+            else if (!paused && win.usable)
+                win.pick(win.chosen)
+        }
+        function onSeekAsked(position) {
+            if (win.player && win.player.duration > 0)
+                win.player.seek(position / win.player.duration)
+        }
+        function onRaiseAsked() {
+            win.raise()
+            win.requestActivate()
+        }
+        function onQuitAsked() { win.close() }
+    }
+
     // The model is told to drop a tune it's still making before the app goes.
     onClosing: flow.stop()
 
@@ -140,6 +167,7 @@ ApplicationWindow {
             source: win.flow.track
             paused: win.paused
             onEnded: win.flow.next()
+            onSought: position => backend.mpris.moved(position)
             onFailed: why => win.flow.playbackFailed(why)
         }
     }
