@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QUrl>
 #include <algorithm>
@@ -39,18 +40,35 @@ Models::Models(const QString &stateDirectory, const QString &keyPath, const QStr
                                           .split('\n', Qt::SkipEmptyParts);
             const auto said = std::find_if(lines.rbegin(), lines.rend(), [](const QString &l) { return l.startsWith("Error: "); });
             m_error = said != lines.rend() ? said->mid(7).trimmed() : tr("The music model couldn't be started");
+            m_queue.clear();
+            reload();
+            emit changed();
+            return;
         }
         reload();
-        emit changed();
+        runNext();
     });
     connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart)
             return;
         m_error = tr("omarchy-agent-local couldn't be run");
+        m_queue.clear();
         emit changed();
     });
 
     reload();
+    // The engine's list is rewritten after package updates; refreshing once
+    // here means a newly installed engine's models show without a restart.
+    // Its result arrives through the watched files, and a refresh that fails
+    // is nothing to tell the user about.
+    if (!m_command.isEmpty()) {
+        QProcess refresh;
+        refresh.setProgram(m_command);
+        refresh.setArguments({"refresh", "--quiet"});
+        refresh.setStandardOutputFile(QProcess::nullDevice());
+        refresh.setStandardErrorFile(QProcess::nullDevice());
+        refresh.startDetached();
+    }
 }
 
 Models::Discovery Models::discover(const QJsonObject &status, const QJsonArray &list, bool engine) {
@@ -62,12 +80,21 @@ Models::Discovery Models::discover(const QJsonObject &status, const QJsonArray &
 
     const QJsonObject models = status.value("models").toObject();
     QList<QJsonObject> music;
+    QStringList runningText, runningTextIds;
     for (auto it = models.begin(); it != models.end(); ++it) {
         QJsonObject row = it.value().toObject();
         row.insert("id", it.key());
-        if (isMusic(row))
+        if (isMusic(row)) {
             music << row;
+        } else if (row.value("kind").toString("text") == "text" && row.value("unit").toString() == "active") {
+            runningText << row.value("name").toString(it.key());
+            runningTextIds << it.key();
+        }
     }
+    // This machine's own before a paired host's.
+    std::stable_sort(music.begin(), music.end(), [](const QJsonObject &a, const QJsonObject &b) {
+        return !a.contains("host") && b.contains("host");
+    });
     auto take = [&](const QJsonObject &row, const QString &state) {
         found.id = row.value("id").toString();
         found.name = row.value("name").toString(found.id);
@@ -93,7 +120,15 @@ Models::Discovery Models::discover(const QJsonObject &status, const QJsonArray &
         }
     }
     if (!music.isEmpty()) {
-        take(music.first(), "installed");
+        // One the memory can't hold right now waits for the text models in its way.
+        const QJsonObject &row = music.first();
+        const bool blocked = !row.value("fits").toBool(true) && !runningText.isEmpty();
+        take(row, blocked ? "blocked" : "installed");
+        found.reason = row.value("fit_reason").toString();
+        if (blocked) {
+            found.blockers = runningText;
+            found.blockerIds = runningTextIds;
+        }
         return found;
     }
 
@@ -128,28 +163,52 @@ QString Models::origin() const {
 }
 
 QByteArray Models::key() const {
-    QFile file(m_keyPath);
+    const QString host = m_found.id.contains('/') ? m_found.id.section('/', 0, 0) : QString();
+    static const QRegularExpression name("^[a-z0-9-]+$");
+    if (!host.isEmpty() && !name.match(host).hasMatch())
+        return {};
+    QFile file(host.isEmpty() ? m_keyPath : QFileInfo(m_keyPath).absolutePath() + "/remotes/" + host + ".key");
     return file.open(QIODevice::ReadOnly) ? file.readAll().trimmed() : QByteArray();
 }
 
 void Models::start() {
     if (m_found.state == "installed")
-        run({"start", m_found.id});
+        run({{"start", m_found.id}});
+}
+
+void Models::makeRoom() {
+    if (m_found.state != "blocked")
+        return;
+    QList<QStringList> commands;
+    for (const QString &id : m_found.blockerIds)
+        commands << QStringList{"stop", id};
+    commands << QStringList{"start", m_found.id};
+    run(commands);
 }
 
 void Models::install() {
+    // A setup that failed is tried again the same way: the engine replaces
+    // the failed record rather than inheriting its error.
     if (m_found.state == "installable")
-        run({"use", m_found.id, "--detach"});
+        run({{"use", m_found.id, "--detach"}});
 }
 
-void Models::run(const QStringList &arguments) {
+void Models::run(const QList<QStringList> &commands) {
     if (working())
         return;
     m_error.clear();
-    if (m_command.isEmpty())
+    if (m_command.isEmpty()) {
         m_error = tr("omarchy-agent-local couldn't be run");
-    else
-        m_process.start(m_command, arguments);
+        emit changed();
+        return;
+    }
+    m_queue = commands;
+    runNext();
+}
+
+void Models::runNext() {
+    if (!m_queue.isEmpty())
+        m_process.start(m_command, m_queue.takeFirst());
     emit changed();
 }
 
@@ -162,14 +221,27 @@ void Models::reload() {
     QString ancestor = m_directory;
     while (!QFileInfo::exists(ancestor) && ancestor != "/")
         ancestor = QFileInfo(ancestor).absolutePath();
-    QStringList candidates{ancestor, m_directory, m_directory + "/status.json", m_directory + "/list.json"};
+    QStringList candidates{ancestor, m_directory, m_directory + "/status.json", m_directory + "/list.json", m_directory + "/network.json"};
     candidates.removeDuplicates();
     for (const QString &path : candidates)
         if (QFileInfo::exists(path))
             m_watcher.addPath(path);
 
-    const Discovery found = discover(readJson(m_directory + "/status.json").object(), readJson(m_directory + "/list.json").array(),
-                                     !m_command.isEmpty());
+    QJsonObject status = readJson(m_directory + "/status.json").object();
+    // A paired host's running music model, shared on the tailnet, serves when
+    // this machine has none running, named for its host.
+    QJsonObject models = status.value("models").toObject();
+    const QJsonObject network = readJson(m_directory + "/network.json").object().value("models").toObject();
+    for (auto it = network.begin(); it != network.end(); ++it) {
+        QJsonObject row = it.value().toObject();
+        if (!isMusic(row) || !row.value("paired").toBool() || !row.value("offline").toString().isEmpty()
+            || row.value("unit").toString() != "active")
+            continue;
+        row.insert("name", tr("%1 on %2").arg(row.value("name").toString(it.key()), row.value("host").toString()));
+        models.insert(it.key(), row);
+    }
+    status.insert("models", models);
+    const Discovery found = discover(status, readJson(m_directory + "/list.json").array(), !m_command.isEmpty());
     if (found == m_found)
         return;
     m_found = found;

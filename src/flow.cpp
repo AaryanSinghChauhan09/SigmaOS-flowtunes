@@ -35,6 +35,8 @@ Flow::Flow(Models *models, const QString &musicFolder, QObject *parent)
     m_poll.setSingleShot(true);
     m_poll.setInterval(500);
     connect(&m_poll, &QTimer::timeout, this, &Flow::poll);
+    m_again.setSingleShot(true);
+    connect(&m_again, &QTimer::timeout, this, [this] { pump(); });
     connect(m_models, &Models::changed, this, [this] { pump(); });
 }
 
@@ -101,6 +103,7 @@ void Flow::retry() {
     if (m_error.isEmpty())
         return;
     m_error.clear();
+    m_failures = 0;
     emit changed();
     if (m_current.path.isEmpty() && !m_queue.isEmpty())
         advance();
@@ -130,7 +133,7 @@ QNetworkReply *Flow::send(const QString &method, const QString &path, const QJso
 void Flow::pump(bool again) {
     // Two tunes ready behind the one playing: a skip never has to wait, and
     // the model makes a tune many times faster than it plays.
-    if (m_genre.isEmpty() || m_filling || !m_error.isEmpty() || m_queue.size() >= tunesAhead)
+    if (m_genre.isEmpty() || m_filling || m_again.isActive() || !m_error.isEmpty() || m_queue.size() >= tunesAhead)
         return;
     // A tune made before needs no model, only its shape read.
     if (!m_library.isEmpty()) {
@@ -155,6 +158,8 @@ void Flow::pump(bool again) {
             emit changed();
         }
     }
+    // A blocked model waits for the user: the window offers to stop the
+    // models in its way, which is theirs to decide.
 }
 
 void Flow::compose() {
@@ -304,6 +309,11 @@ void Flow::shape(Track track) {
 }
 
 void Flow::enqueue(const Track &track) {
+    // The model made a tune, so it's well; should it stop later, it's started again.
+    if (m_composing) {
+        m_failures = 0;
+        m_asked = false;
+    }
     m_composing = false;
     m_filling = false;
     m_queue << track;
@@ -330,13 +340,22 @@ void Flow::fail(const QString &error) {
     m_filling = false;
     m_job.clear();
     m_poll.stop();
-    m_error = error;
+    // Once more by itself, starting the model again if it has stopped; a
+    // second failure in a row is the user's to see.
+    if (++m_failures < 2) {
+        m_asked = false;
+        m_again.start(retryDelayMs);
+    } else {
+        m_error = error;
+    }
     emit changed();
 }
 
 void Flow::reset() {
     ++m_run;
     m_poll.stop();
+    m_again.stop();
+    m_failures = 0;
     if (!m_job.isEmpty())
         cancelJob(m_job);
     m_job.clear();

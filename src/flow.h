@@ -71,6 +71,9 @@ public:
     static constexpr int trackSeconds = 180;
     // How many finished tunes wait behind the one playing.
     static constexpr int tunesAhead = 2;
+    // A tune that fails is tried once more by itself after this long, since
+    // a model that was just restarted or swapped out is soon back.
+    int retryDelayMs = 3000;
     // A tune's shape: how loud each part of it is from start to end, as
     // `waveBars` levels from 0 to 1, out of its sound as 16-bit mono samples.
     static QVariantList shapeOf(const QByteArray &samples);
@@ -95,7 +98,8 @@ private:
 
     QNetworkReply *send(const QString &method, const QString &path, const QJsonObject &body = {});
     // Makes another tune when one is wanted and the model is ready, starting
-    // the model when it's only set up. `again` tries a start that failed.
+    // the model when it's set up but stopped, whether it never ran or stopped
+    // in the middle of the flow. `again` tries a start that failed.
     void pump(bool again = false);
     void compose();
     // Hands the model a job, follows it until it's done, and gives its result to `done`.
@@ -114,6 +118,9 @@ private:
     QString m_musicFolder;
     QNetworkAccessManager m_network;
     QTimer m_poll;
+    QTimer m_again;
+    // Tunes that have failed in a row.
+    int m_failures = 0;
 
     QString m_genre;
     Track m_current;

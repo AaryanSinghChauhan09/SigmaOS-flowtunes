@@ -42,7 +42,17 @@ ApplicationWindow {
 
     // A music model is there to play with: running, starting, or set up and
     // started with the first genre picked.
-    readonly property bool usable: ["ready", "starting", "installed"].includes(models.state)
+    readonly property bool usable: ["ready", "starting", "installed", "blocked"].includes(models.state)
+    // The model can't start while text models hold the memory it needs.
+    readonly property bool blocked: waiting && models.state === "blocked" && !models.working
+    // What stands in the way of the next tune.
+    readonly property string problem: flow.error !== "" ? flow.error : waiting ? models.error : ""
+    function again() {
+        if (blocked)
+            models.makeRoom()
+        else
+            flow.retry()
+    }
     // The genres are on show: nothing plays yet, or another genre is being picked.
     property bool picking: true
     readonly property bool choosing: picking || flow.genre === ""
@@ -62,6 +72,10 @@ ApplicationWindow {
     function move(by) {
         chosen = (chosen + by + flow.genres.length) % flow.genres.length
     }
+    // Written as the language writes numbers, which is why it's handed over.
+    function gigabytes(bytes, language) {
+        return (bytes / 1e9).toLocaleString(Qt.locale(language), "f", 1)
+    }
     function clock(ms) {
         const seconds = Math.floor(ms / 1000)
         return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0")
@@ -79,13 +93,18 @@ ApplicationWindow {
         onActivated: {
             if (win.choosing)
                 win.pick(win.chosen)
-            else if (win.flow.error !== "")
-                win.flow.retry()
+            else if (win.blocked || win.flow.error !== "")
+                win.again()
             else
                 win.paused = !win.paused
         }
     }
     Shortcut { sequences: ["Return", "Enter"]; enabled: win.usable && win.choosing; onActivated: win.pick(win.chosen) }
+    Shortcut {
+        sequences: ["Return", "Enter"]
+        enabled: win.models.state === "installable" && !win.models.working
+        onActivated: win.models.install()
+    }
     Shortcut { sequence: "Left"; enabled: win.choosing; onActivated: win.move(win.rightToLeft ? 1 : -1) }
     Shortcut { sequence: "Right"; enabled: win.choosing; onActivated: win.move(win.rightToLeft ? -1 : 1) }
     Shortcut { sequence: "Up"; enabled: win.choosing; onActivated: win.move(-tiles.columns) }
@@ -191,6 +210,15 @@ ApplicationWindow {
                 visible: win.models.state === "installing"
                 indeterminate: win.models.totalBytes <= 0
                 value: win.models.totalBytes > 0 ? win.models.doneBytes / win.models.totalBytes : 0
+            }
+            Label {
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                font.pixelSize: 12
+                color: win.muted
+                visible: win.models.state === "installing" && win.models.totalBytes > 0
+                text: qsTr("%1 of %2 GB").arg(win.gigabytes(win.models.doneBytes, translator.language))
+                                         .arg(win.gigabytes(win.models.totalBytes, translator.language))
             }
             FlowButton {
                 objectName: "setUp"
@@ -345,8 +373,9 @@ ApplicationWindow {
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.WordWrap
                 font.pixelSize: 15
-                color: win.flow.error !== "" ? theme.colors.red : win.muted
-                text: win.flow.error !== "" ? win.flow.error
+                color: win.problem !== "" ? theme.colors.red : win.muted
+                text: win.problem !== "" ? win.problem
+                    : win.blocked ? qsTr("%1 needs the memory %2 is using").arg(win.models.name).arg(win.models.blockers.join(", "))
                     : !win.waiting ? win.clock(win.player ? win.player.position : 0) + " / " + win.clock(win.player ? win.player.duration : 0)
                     : win.models.working || win.models.state === "starting" ? qsTr("Starting %1…").arg(win.models.name)
                     : !win.flow.composing ? " "
@@ -367,7 +396,7 @@ ApplicationWindow {
                 FlowButton {
                     objectName: "playPause"
                     highlighted: true
-                    visible: win.flow.error === ""
+                    visible: win.flow.error === "" && !win.blocked
                     enabled: !win.waiting
                     text: win.paused ? qsTr("Play") : qsTr("Pause")
                     onClicked: win.paused = !win.paused
@@ -375,9 +404,9 @@ ApplicationWindow {
                 FlowButton {
                     objectName: "retry"
                     highlighted: true
-                    visible: win.flow.error !== ""
-                    text: qsTr("Try again")
-                    onClicked: win.flow.retry()
+                    visible: win.flow.error !== "" || win.blocked
+                    text: win.blocked ? qsTr("Stop %1 and start %2").arg(win.models.blockers.join(", ")).arg(win.models.name) : qsTr("Try again")
+                    onClicked: win.again()
                 }
                 FlowButton {
                     objectName: "next"

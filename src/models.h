@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QProcess>
+#include <QStringList>
 #include <QTimer>
 
 // The music model omarchy-local-ai runs for Flowtunes. It reads the engine's
@@ -12,11 +13,13 @@
 // the model through omarchy-agent-local.
 class Models : public QObject {
     Q_OBJECT
-    // noEngine, none, installable, installing, installed, starting, ready
+    // noEngine, none, installable, installing, installed, blocked, starting, ready
     Q_PROPERTY(QString state READ state NOTIFY changed)
     Q_PROPERTY(QString name READ name NOTIFY changed)
     // Why no music model runs here, or why its setup failed.
     Q_PROPERTY(QString reason READ reason NOTIFY changed)
+    // The running text models that hold the memory a blocked model needs.
+    Q_PROPERTY(QStringList blockers READ blockers NOTIFY changed)
     // Why the engine couldn't do what it was last asked.
     Q_PROPERTY(QString error READ error NOTIFY changed)
     Q_PROPERTY(bool working READ working NOTIFY changed)
@@ -31,12 +34,14 @@ public:
         QString name;
         QString endpoint;
         QString reason;
+        QStringList blockers;
+        QStringList blockerIds;
         qint64 doneBytes = 0;
         qint64 totalBytes = 0;
 
         bool operator==(const Discovery &other) const {
             return state == other.state && id == other.id && name == other.name && endpoint == other.endpoint
-                   && reason == other.reason && doneBytes == other.doneBytes && totalBytes == other.totalBytes;
+                   && reason == other.reason && blockers == other.blockers && blockerIds == other.blockerIds && doneBytes == other.doneBytes && totalBytes == other.totalBytes;
         }
     };
 
@@ -52,17 +57,23 @@ public:
     QString state() const { return m_found.state; }
     QString name() const { return m_found.name; }
     QString reason() const { return m_found.reason; }
+    QStringList blockers() const { return m_found.blockers; }
     QString error() const { return m_error; }
-    bool working() const { return m_process.state() != QProcess::NotRunning; }
+    bool working() const { return m_process.state() != QProcess::NotRunning || !m_queue.isEmpty(); }
     qint64 doneBytes() const { return m_found.doneBytes; }
     qint64 totalBytes() const { return m_found.totalBytes; }
 
     // The ready model's server, as scheme://host:port, and the engine's key.
     QString origin() const;
+    // The key it takes: the engine's own, or for a paired host's model
+    // (host/recipe), the one that host gave when pairing.
     QByteArray key() const;
 
-    // Starts the model that's set up, or sets up the one on offer.
+    // Starts the model that's set up.
     Q_INVOKABLE void start();
+    // Stops the text models in a blocked model's way, then starts it.
+    Q_INVOKABLE void makeRoom();
+    // Sets up the one on offer, or tries again a setup that failed.
     Q_INVOKABLE void install();
 
 signals:
@@ -70,7 +81,8 @@ signals:
 
 private:
     void reload();
-    void run(const QStringList &arguments);
+    void run(const QList<QStringList> &commands);
+    void runNext();
 
     QString m_directory;
     QString m_keyPath;
@@ -80,4 +92,5 @@ private:
     QFileSystemWatcher m_watcher;
     QTimer m_debounce;
     QProcess m_process;
+    QList<QStringList> m_queue;
 };

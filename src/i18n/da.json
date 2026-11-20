@@ -1,4 +1,7 @@
 {
+  "%1 needs the memory %2 is using": "%1 skal bruge den hukommelse, %2 bruger",
+  "%1 of %2 GB": "%1 af %2 GB",
+  "%1 on %2": "%1 på %2",
   "%L1 BPM": "%L1 BPM",
   "Acoustic": "Akustisk",
   "Ambient": "Ambient",
@@ -33,6 +36,7 @@
   "Show or hide the shortcuts": "Vis eller skjul genvejene",
   "Skip to the next tune": "Spring til næste nummer",
   "Starting %1…": "Starter %1…",
+  "Stop %1 and start %2": "Stop %1 og start %2",
   "Synthwave": "Synthwave",
   "Techno": "Techno",
   "The model makes every tune on this machine. It's a download of a few gigabytes, once.": "Modellen laver hvert nummer på denne maskine. Den hentes én gang og fylder nogle få gigabyte.",

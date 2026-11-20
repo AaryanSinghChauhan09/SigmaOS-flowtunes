@@ -1,4 +1,7 @@
 {
+  "%1 needs the memory %2 is using": "%1 needs the memory %2 is using",
+  "%1 of %2 GB": "%1 of %2 GB",
+  "%1 on %2": "%1 on %2",
   "%L1 BPM": "%L1 BPM",
   "Acoustic": "Acoustic",
   "Ambient": "Ambient",
@@ -33,6 +36,7 @@
   "Show or hide the shortcuts": "Show or hide the shortcuts",
   "Skip to the next tune": "Skip to the next tune",
   "Starting %1…": "Starting %1…",
+  "Stop %1 and start %2": "Stop %1 and start %2",
   "Synthwave": "Synthwave",
   "Techno": "Techno",
   "The model makes every tune on this machine. It's a download of a few gigabytes, once.": "The model makes every tune on this machine. It's a download of a few gigabytes, once.",

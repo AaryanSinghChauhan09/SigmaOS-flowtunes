@@ -259,7 +259,8 @@ QByteArray tone() {
 // A stand-in for omarchy-agent-local that notes what it was asked.
 QString fakeEngine(const QString &folder) {
     const QString path = folder + "/engine";
-    write(path, "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/asked\"\n");
+    // The refresh every start asks for is beside the point of any test.
+    write(path, "#!/bin/sh\n[ \"$1\" = refresh ] && exit 0\necho \"$@\" >> \"$(dirname \"$0\")/asked\"\n");
     QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     return path;
 }
@@ -312,6 +313,21 @@ private slots:
         QCOMPARE(Models::discover(status("music", "activating"), {}, true).state, QString("starting"));
         QCOMPARE(Models::discover(status("music", "inactive"), {}, true).state, QString("installed"));
         QCOMPARE(Models::discover(status("music", "installing"), {}, true).state, QString("installing"));
+        // A stopped model that doesn't fit waits for the text models in its way.
+        QJsonObject crowded = status("music", "inactive");
+        QJsonObject rows = crowded.value("models").toObject();
+        QJsonObject music = rows.value("m").toObject();
+        music.insert("fits", false);
+        music.insert("fit_reason", "needs 8 GiB");
+        rows.insert("m", music);
+        rows.insert("llm", QJsonObject{{"kind", "text"}, {"name", "Big Talker"}, {"unit", "active"}});
+        rows.insert("idle", QJsonObject{{"kind", "text"}, {"name", "Quiet One"}, {"unit", "inactive"}});
+        crowded.insert("models", rows);
+        const Models::Discovery blocked = Models::discover(crowded, {}, true);
+        QCOMPARE(blocked.state, QString("blocked"));
+        QCOMPARE(blocked.blockers, QStringList{"Big Talker"});
+        QCOMPARE(blocked.blockerIds, QStringList{"llm"});
+        QCOMPARE(blocked.reason, QString("needs 8 GiB"));
         // An image model is no use here.
         QCOMPARE(Models::discover(status("image", "active"), {}, true).state, QString("none"));
 
@@ -342,6 +358,74 @@ private slots:
         engineWith(dir.path(), "active", "http://127.0.0.1:1");
         QTRY_COMPARE(models.state(), QString("ready"));
         QCOMPARE(models.origin(), QString("http://127.0.0.1:1"));
+    }
+
+    void aBlockedModelIsStartedOnceItsWayIsCleared() {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.path() + "/status.json", QJsonDocument(QJsonObject{{"models", QJsonObject{
+            {"ace-step", QJsonObject{{"kind", "music"}, {"name", "ACE-Step"}, {"unit", "inactive"}, {"fits", false}}},
+            {"llm", QJsonObject{{"kind", "text"}, {"name", "Big Talker"}, {"unit", "active"}}}}}}).toJson()));
+        QVERIFY(write(dir.path() + "/list.json", "[]"));
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        QCOMPARE(models.state(), QString("blocked"));
+        // The flow doesn't stop anyone's model by itself.
+        flow.play("jazz");
+        QTest::qWait(300);
+        QVERIFY(!QFile::exists(dir.path() + "/asked"));
+        QVERIFY(flow.error().isEmpty());
+
+        models.makeRoom();
+        QTRY_VERIFY(!models.working());
+        QFile asked(dir.path() + "/asked");
+        QVERIFY(asked.open(QIODevice::ReadOnly));
+        QCOMPARE(asked.readAll(), QByteArray("stop llm\nstart ace-step\n"));
+    }
+
+    void aPairedHostsModelServes() {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.path() + "/status.json", "{\"models\":{}}"));
+        QVERIFY(write(dir.path() + "/list.json", "[]"));
+        const auto shared = [](const QString &host, bool paired) {
+            return QJsonObject{{"kind", "music"}, {"name", "ACE-Step"}, {"host", host}, {"paired", paired}, {"offline", ""},
+                               {"unit", "active"}, {"endpoint", "http://" + host + ":8443/local-ai/ace-step/v1"}};
+        };
+        QVERIFY(write(dir.path() + "/network.json", QJsonDocument(QJsonObject{{"models", QJsonObject{
+            {"studio/ace-step", shared("studio", true)}, {"attic/ace-step", shared("attic", false)}}}}).toJson()));
+        QVERIFY(QDir(dir.path()).mkpath("remotes"));
+        QVERIFY(write(dir.path() + "/key", "mine\n"));
+        QVERIFY(write(dir.path() + "/remotes/studio.key", "theirs\n"));
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        QCOMPARE(models.state(), QString("ready"));
+        QCOMPARE(models.name(), QString("ACE-Step on studio"));
+        QCOMPARE(models.origin(), QString("http://studio:8443/local-ai/ace-step"));
+        QCOMPARE(models.key(), QByteArray("theirs"));
+    }
+
+    void aModelThatStopsMidFlowIsStartedAgain() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.retryDelayMs = 50;
+        flow.play("techno");
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty() && !flow.composing(), 10000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.count("POST /synth"), 3, 10000);
+        QTRY_VERIFY(!flow.composing());
+
+        // The model stops while the music plays on what's ready.
+        engineWith(dir.path(), "inactive", server.origin());
+        QTRY_COMPARE(models.state(), QString("installed"));
+        flow.next();
+        // It's asked to start again, with nothing said of it.
+        QTRY_COMPARE(lines(dir.path() + "/asked"), 1);
+        QVERIFY(flow.error().isEmpty());
+        QVERIFY(!flow.track().isEmpty());
+        engineWith(dir.path(), "active", server.origin());
+        QTRY_COMPARE_WITH_TIMEOUT(server.count("POST /synth"), 4, 10000);
+        QVERIFY(flow.error().isEmpty());
     }
 
     void aFlowKeepsTwoTunesAhead() {
@@ -448,12 +532,14 @@ private slots:
         engineWith(dir.path(), "active", server.origin());
         Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
         Flow flow(&models, dir.path() + "/music");
+        flow.retryDelayMs = 50;
         flow.play("dnb");
         QTRY_COMPARE_WITH_TIMEOUT(flow.error(), QString("The tune couldn't be made"), 10000);
         QVERIFY(!flow.composing());
-        // It doesn't try again by itself.
+        // Tried once more by itself, and then no more.
+        QCOMPARE(server.count("POST /lm"), 2);
         QTest::qWait(700);
-        QCOMPARE(server.count("POST /lm"), 1);
+        QCOMPARE(server.count("POST /lm"), 2);
 
         server.broken = false;
         flow.retry();
@@ -475,6 +561,7 @@ private slots:
         engineWith(dir.path(), "active", "http://127.0.0.1:9");
         Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
         Flow flow(&models, dir.path() + "/music");
+        flow.retryDelayMs = 50;
         flow.play("jazz");
         QTRY_VERIFY_WITH_TIMEOUT(flow.error().startsWith("The music model didn't answer: "), 10000);
     }
