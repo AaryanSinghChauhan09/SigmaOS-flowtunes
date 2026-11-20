@@ -80,7 +80,18 @@ ApplicationWindow {
         const seconds = Math.floor(ms / 1000)
         return Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0")
     }
-    Component.onCompleted: if (usable && flow.genres.includes(backend.initialGenre)) pick(flow.genres.indexOf(backend.initialGenre))
+    // The genre `flowtunes <genre>` asked for, played once there's a model to
+    // play it with, which may be after it has been set up.
+    property string wanted: backend.initialGenre
+    function begin() {
+        if (!usable || !flow.genres.includes(wanted))
+            return
+        const index = flow.genres.indexOf(wanted)
+        wanted = ""
+        pick(index)
+    }
+    Component.onCompleted: begin()
+    onUsableChanged: begin()
 
     // The model is told to drop a tune it's still making before the app goes.
     onClosing: flow.stop()
@@ -201,6 +212,9 @@ ApplicationWindow {
             colorB: theme.accent
             colorC: theme.colors.magenta || theme.accent
             intensity: !win.usable || win.choosing ? 0.5 : win.paused ? 0.3 : 1
+            // Still while the music is: it redraws the whole window on the
+            // GPU the model makes the music with.
+            moving: !win.paused || win.choosing
             Behavior on intensity { NumberAnimation { duration: 600; easing.type: Easing.InOutSine } }
         }
 

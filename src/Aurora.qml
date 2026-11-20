@@ -10,7 +10,8 @@ ShaderEffect {
     property color colorC   // their top
     property real intensity: 1
     property real time: 0
+    property bool moving: true
     readonly property real aspect: width / Math.max(1, height)
     fragmentShader: "qrc:/aurora.frag.qsb"
-    NumberAnimation on time { running: aurora.visible; from: 0; to: 3600; duration: 3600000; loops: Animation.Infinite }
+    NumberAnimation on time { running: aurora.visible; paused: running && !aurora.moving; from: 0; to: 3600; duration: 3600000; loops: Animation.Infinite }
 }

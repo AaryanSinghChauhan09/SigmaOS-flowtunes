@@ -34,7 +34,8 @@ class Flow : public QObject {
     // Which tune of this flow it is, from 1.
     Q_PROPERTY(int number READ number NOTIFY changed)
     Q_PROPERTY(bool composing READ composing NOTIFY changed)
-    // Why the flow has stopped making tunes.
+    // Why there's nothing to play. While a tune plays, trouble making the
+    // next one is tried again quietly, and said only once the music runs out.
     Q_PROPERTY(QString error READ error NOTIFY changed)
 
 public:
@@ -62,8 +63,9 @@ public:
     // On to the next tune: the one playing has ended, or is skipped.
     Q_INVOKABLE void next();
     Q_INVOKABLE void retry();
-    // The tune couldn't be played, so the flow stops rather than have the
-    // model make tune after tune nobody hears.
+    // The tune couldn't be played. One that can't is passed over; when tune
+    // after tune can't, the flow stops rather than have the model make more
+    // that nobody hears.
     Q_INVOKABLE void playbackFailed(const QString &why);
 
     // A tune's length. Longer tunes mean fewer breaks in the music and less
@@ -74,6 +76,8 @@ public:
     // A tune that fails is tried once more by itself after this long, since
     // a model that was just restarted or swapped out is soon back.
     int retryDelayMs = 3000;
+    // A model asked to start that is still stopped after this long didn't start.
+    int startGraceMs = 20000;
     // A tune's shape: how loud each part of it is from start to end, as
     // `waveBars` levels from 0 to 1, out of its sound as 16-bit mono samples.
     static QVariantList shapeOf(const QByteArray &samples);
@@ -93,6 +97,8 @@ private:
         QVariantList wave;
         int bpm = 0;
         QString key;
+        // Made by this flow, rather than found in the genre's folder.
+        bool made = false;
     };
     using Done = std::function<void(const QByteArray &result)>;
 
@@ -119,8 +125,14 @@ private:
     QNetworkAccessManager m_network;
     QTimer m_poll;
     QTimer m_again;
-    // Tunes that have failed in a row.
+    QTimer m_patience;
+    // Tunes that couldn't be made in a row, and why the last one couldn't.
     int m_failures = 0;
+    QString m_trouble;
+    // Tunes that couldn't be played in a row.
+    int m_unplayed = 0;
+    // The model was asked to start and stayed stopped.
+    bool m_stalled = false;
 
     QString m_genre;
     Track m_current;

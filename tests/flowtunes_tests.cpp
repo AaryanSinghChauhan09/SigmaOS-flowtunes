@@ -540,19 +540,118 @@ private slots:
         QCOMPARE(server.count("POST /lm"), 2);
         QTest::qWait(700);
         QCOMPARE(server.count("POST /lm"), 2);
+        // Neither job it gave up on is left with the model.
+        QTRY_COMPARE(server.requests.filter("cancel=1").size(), 2);
 
         server.broken = false;
         flow.retry();
         QVERIFY(flow.error().isEmpty());
         QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+    }
 
-        // A tune that can't be played stops the flow too, and says why.
-        QTRY_VERIFY_WITH_TIMEOUT(!flow.composing(), 10000);
+    void aTuneThatCannotBePlayedIsPassedOver() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.play("jazz");
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") == 3 && !flow.composing(), 10000);
+
+        // One that can't be played gives way to the next, with nothing said.
+        server.held = true;
+        const QUrl first = flow.track();
+        flow.playbackFailed("no such file");
+        QVERIFY(flow.error().isEmpty());
+        QVERIFY(!flow.track().isEmpty());
+        QVERIFY(flow.track() != first);
+        // Three in a row is the sound itself: the flow stops, and says why.
+        flow.playbackFailed("no sound card");
+        QVERIFY(flow.error().isEmpty());
         flow.playbackFailed("no sound card");
         QCOMPARE(flow.error(), QString("The tune couldn't be played: no sound card"));
         QVERIFY(flow.track().isEmpty());
+
+        // A tune that was on its way arrives, and waits to be asked.
+        server.held = false;
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") >= 4 && !flow.composing(), 10000);
+        QTest::qWait(300);
+        QVERIFY(flow.track().isEmpty());
+        QVERIFY(!flow.error().isEmpty());
         flow.retry();
+        QVERIFY(flow.error().isEmpty());
         QVERIFY(!flow.track().isEmpty());
+    }
+
+    void troubleBehindTheMusicWaitsUntilItRunsOut() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.retryDelayMs = 50;
+        flow.play("lofi");
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") == 3 && !flow.composing(), 10000);
+
+        // The next tune fails, and fails again, while one plays: it's tried
+        // again every so often, and the music is left alone.
+        server.broken = true;
+        flow.next();
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /lm") >= 6, 10000);
+        QVERIFY(flow.error().isEmpty());
+        QVERIFY(!flow.track().isEmpty());
+
+        // Once there's nothing left to play, it's said.
+        flow.next();
+        QVERIFY(flow.error().isEmpty());
+        flow.next();
+        QTRY_COMPARE_WITH_TIMEOUT(flow.error(), QString("The tune couldn't be made"), 10000);
+        QVERIFY(flow.track().isEmpty());
+
+        server.broken = false;
+        flow.retry();
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+        QVERIFY(flow.error().isEmpty());
+    }
+
+    void aModelThatTakesItsStartAndStaysStoppedIsSaid() {
+        QTemporaryDir dir;
+        engineWith(dir.path(), "inactive", "http://127.0.0.1:9");
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.startGraceMs = 200;
+        flow.play("jazz");
+        QTRY_COMPARE(lines(dir.path() + "/asked"), 1);
+        QTRY_COMPARE_WITH_TIMEOUT(flow.error(), QString("ACE-Step 1.5 Turbo didn't start"), 10000);
+        // Asking again starts it again.
+        flow.retry();
+        QVERIFY(flow.error().isEmpty());
+        QTRY_COMPARE(lines(dir.path() + "/asked"), 2);
+    }
+
+    void aFileWithNoSoundInItIsPassedOver() {
+        QTemporaryDir dir;
+        engineWith(dir.path(), "inactive", "http://127.0.0.1:9");
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        QVERIFY(QDir().mkpath(flow.folder("jazz")));
+        QVERIFY(write(flow.folder("jazz") + "/empty.mp3", ""));
+        QVERIFY(write(flow.folder("jazz") + "/not music.mp3", "words, not sound"));
+        // Anything in the genre's folder plays, whoever put it there.
+        QVERIFY(write(flow.folder("jazz") + "/a song of my own.mp3", m_tone));
+
+        flow.play("jazz");
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+        QCOMPARE(QFileInfo(flow.track().toLocalFile()).fileName(), QString("a song of my own.mp3"));
+        QCOMPARE(flow.number(), 1);
+        QCOMPARE(flow.wave().size(), Flow::waveBars);
+        // The other two never come up: the model is started for what's next.
+        QTRY_VERIFY(QFile::exists(dir.path() + "/asked"));
+        flow.next();
+        QVERIFY(flow.track().isEmpty());
+        QVERIFY(flow.error().isEmpty());
     }
 
     void aModelThatDoesNotAnswerIsSaid() {
@@ -975,6 +1074,8 @@ private slots:
         write(state + "/status.json", "{\"models\":{}}");
         write(state + "/list.json", R"([{"id":"ace-step","kind":"music","name":"ACE-Step 1.5 Turbo","available":true}])");
         Backend backend({state, state + "/key", fakeEngine(dir.path()), dir.path() + "/music"});
+        // As `flowtunes jazz` starts it.
+        backend.setInitialGenre("jazz");
 
         QQmlApplicationEngine engine;
         QStringList warnings;
@@ -1006,9 +1107,11 @@ private slots:
         QVERIFY(asked.open(QIODevice::ReadOnly));
         QCOMPARE(asked.readAll(), QByteArray("use ace-step --detach\n"));
 
-        // Once it's set up and running, the genres are there to pick.
+        // Once it's set up and running, the genre asked for from the start plays.
         engineWith(state, "active", "http://127.0.0.1:9");
-        QTRY_VERIFY(item(window->contentItem(), "picker")->isVisible());
+        QTRY_COMPARE(backend.flow()->genre(), QString("jazz"));
+        QVERIFY(item(window->contentItem(), "playing")->isVisible());
+        QVERIFY(!item(window->contentItem(), "picker")->isVisible());
 
         QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
         QCoreApplication::removeTranslator(&translator);

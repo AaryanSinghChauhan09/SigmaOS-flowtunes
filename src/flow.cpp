@@ -25,6 +25,13 @@ namespace {
 
 QJsonObject parse(const QByteArray &body) { return QJsonDocument::fromJson(body).object(); }
 
+// Keeps the app running for as long as the request it's given to is out,
+// even when its window has closed.
+struct Stay : QObject {
+    using QObject::QObject;
+    QEventLoopLocker locker;
+};
+
 } // namespace
 
 Flow::Flow(Models *models, const QString &musicFolder, QObject *parent)
@@ -38,6 +45,20 @@ Flow::Flow(Models *models, const QString &musicFolder, QObject *parent)
     m_again.setSingleShot(true);
     connect(&m_again, &QTimer::timeout, this, [this] { pump(); });
     connect(m_models, &Models::changed, this, [this] { pump(); });
+    // A model that takes its start and then stays stopped says nothing more,
+    // so it's given a while and then called what it is.
+    m_patience.setSingleShot(true);
+    connect(&m_patience, &QTimer::timeout, this, [this] {
+        if (m_genre.isEmpty() || !m_asked)
+            return;
+        const QString state = m_models->state();
+        if (m_models->working() || state == "starting") {
+            m_patience.start(startGraceMs);
+        } else if (state == "installed") {
+            m_stalled = true;
+            pump();
+        }
+    });
 }
 
 QStringList Flow::genres() const { return Genres::ids(); }
@@ -71,8 +92,10 @@ void Flow::stop() {
 }
 
 void Flow::next() {
-    if (!m_genre.isEmpty())
-        advance();
+    if (m_genre.isEmpty())
+        return;
+    m_unplayed = 0;
+    advance();
 }
 
 QString Flow::folder(const QString &genre) const { return m_musicFolder + "/" + Genres::name(genre); }
@@ -104,6 +127,8 @@ void Flow::retry() {
         return;
     m_error.clear();
     m_failures = 0;
+    m_unplayed = 0;
+    m_trouble.clear();
     emit changed();
     if (m_current.path.isEmpty() && !m_queue.isEmpty())
         advance();
@@ -114,6 +139,11 @@ void Flow::retry() {
 void Flow::playbackFailed(const QString &why) {
     if (m_current.path.isEmpty())
         return;
+    // A file that's broken or gone is one tune; three in a row is the sound itself.
+    if (++m_unplayed < 3) {
+        advance();
+        return;
+    }
     m_current = {};
     m_error = tr("The tune couldn't be played: %1").arg(why);
     emit changed();
@@ -152,9 +182,11 @@ void Flow::pump(bool again) {
     } else if (state == "installed" && !m_models->working()) {
         if (!m_asked || again) {
             m_asked = true;
+            m_stalled = false;
+            m_patience.start(startGraceMs);
             m_models->start();
-        } else if (!m_models->error().isEmpty()) {
-            m_error = m_models->error();
+        } else if ((m_stalled || !m_models->error().isEmpty()) && m_current.path.isEmpty()) {
+            m_error = !m_models->error().isEmpty() ? m_models->error() : tr("%1 didn't start").arg(m_models->name());
             emit changed();
         }
     }
@@ -177,6 +209,7 @@ void Flow::compose() {
             return;
         }
         Track track;
+        track.made = true;
         track.bpm = song.value("bpm").toInt();
         track.key = song.value("keyscale").toString();
         submit("/synth", song, [this, track](const QByteArray &rendered) mutable {
@@ -210,6 +243,9 @@ void Flow::compose() {
 void Flow::submit(const QString &path, const QJsonObject &body, Done done) {
     m_done = std::move(done);
     QNetworkReply *reply = send("POST", path, body);
+    // The app stays until the job has a name, so one handed over as the
+    // window closes can still be called off.
+    new Stay(reply);
     connect(reply, &QNetworkReply::finished, this, [this, reply, run = m_run] {
         reply->deleteLater();
         const QString id = parse(reply->readAll()).value("id").toString();
@@ -268,32 +304,62 @@ void Flow::poll() {
 void Flow::cancelJob(const QString &id) {
     // The app stays until the model has heard, even when its window closes,
     // so a tune nobody will hear doesn't keep the GPU busy.
-    auto locker = std::make_shared<QEventLoopLocker>();
     QNetworkReply *reply = send("POST", "/job?id=" + id + "&cancel=1");
-    connect(reply, &QNetworkReply::finished, reply, [reply, locker] { reply->deleteLater(); });
+    new Stay(reply);
+    connect(reply, &QNetworkReply::finished, reply, &QObject::deleteLater);
 }
 
 QVariantList Flow::shapeOf(const QByteArray &samples) {
     // Each bar is how loud its share of the tune is on the whole, against
     // the loudest of them: a tune's peaks are all alike, its parts are not.
     const qsizetype count = samples.size() / 2;
-    QList<qint64> sums(waveBars, 0);
-    for (qsizetype i = 0; i < count; ++i)
+    QList<qint64> sums(waveBars, 0), shares(waveBars, 0);
+    for (qsizetype i = 0; i < count; ++i) {
         sums[i * waveBars / count] += std::abs(int(qFromLittleEndian<qint16>(samples.constData() + i * 2)));
-    const qint64 loudest = *std::max_element(sums.begin(), sums.end());
+        ++shares[i * waveBars / count];
+    }
+    QList<double> levels(waveBars, 0);
+    for (int i = 0; i < waveBars; ++i)
+        levels[i] = shares[i] > 0 ? double(sums[i]) / shares[i] : 0;
+    const double loudest = *std::max_element(levels.begin(), levels.end());
     QVariantList wave;
     for (int i = 0; loudest > 0 && i < waveBars; ++i)
-        wave << double(sums[i]) / loudest;
+        wave << levels[i] / loudest;
     return wave;
 }
 
 void Flow::shape(Track track) {
     auto *sound = new QProcess(this);
-    connect(sound, &QProcess::finished, this, [this, sound, track, run = m_run]() mutable {
+    // The sound is boiled down as it arrives, a hundredth of a second to a
+    // level, so a file hours long takes no more memory than a tune.
+    auto levels = std::make_shared<QByteArray>();
+    auto rest = std::make_shared<QByteArray>();
+    const auto take = [sound, levels, rest] {
+        constexpr qsizetype window = 80;
+        *rest += sound->readAllStandardOutput();
+        qsizetype at = 0;
+        for (; at + window * 2 <= rest->size(); at += window * 2) {
+            qint64 sum = 0;
+            for (qsizetype i = 0; i < window; ++i)
+                sum += std::abs(int(qFromLittleEndian<qint16>(rest->constData() + at + i * 2)));
+            const qint16 level = qToLittleEndian<qint16>(qint16(sum / window));
+            levels->append(reinterpret_cast<const char *>(&level), 2);
+        }
+        rest->remove(0, at);
+    };
+    connect(sound, &QProcess::readyReadStandardOutput, this, take);
+    connect(sound, &QProcess::finished, this, [this, sound, track, take, levels, run = m_run](int code) mutable {
         sound->deleteLater();
         if (run != m_run)
             return;
-        track.wave = shapeOf(sound->readAllStandardOutput());
+        take();
+        // A file from the folder that holds no sound, or is gone, is passed over.
+        if (!track.made && (code != 0 || levels->isEmpty())) {
+            m_filling = false;
+            pump();
+            return;
+        }
+        track.wave = shapeOf(*levels);
         enqueue(track);
     });
     // Without ffmpeg the tune still plays, with no shape to show.
@@ -312,12 +378,14 @@ void Flow::enqueue(const Track &track) {
     // The model made a tune, so it's well; should it stop later, it's started again.
     if (m_composing) {
         m_failures = 0;
+        m_trouble.clear();
         m_asked = false;
     }
     m_composing = false;
     m_filling = false;
     m_queue << track;
-    if (m_current.path.isEmpty()) {
+    // Nothing starts playing under an error: that waits to be asked again.
+    if (m_current.path.isEmpty() && m_error.isEmpty()) {
         advance();
     } else {
         emit changed();
@@ -330,6 +398,10 @@ void Flow::advance() {
     if (!m_queue.isEmpty()) {
         m_current = m_queue.takeFirst();
         ++m_number;
+    } else if (m_failures >= 2 && !m_filling && m_error.isEmpty()) {
+        // The music has run out while the next tune kept failing.
+        m_again.stop();
+        m_error = m_trouble;
     }
     emit changed();
     pump();
@@ -338,15 +410,23 @@ void Flow::advance() {
 void Flow::fail(const QString &error) {
     m_composing = false;
     m_filling = false;
+    // A job that's given up on, one that timed out say, isn't left running.
+    if (!m_job.isEmpty())
+        cancelJob(m_job);
     m_job.clear();
     m_poll.stop();
-    // Once more by itself, starting the model again if it has stopped; a
-    // second failure in a row is the user's to see.
+    m_trouble = error;
+    // Once more by itself, starting the model again if it has stopped. A
+    // second failure in a row is the user's to see, unless a tune is
+    // playing: then it's tried again every so often, with nothing said.
     if (++m_failures < 2) {
         m_asked = false;
         m_again.start(retryDelayMs);
-    } else {
+    } else if (m_current.path.isEmpty()) {
         m_error = error;
+    } else {
+        m_asked = false;
+        m_again.start(retryDelayMs * 10);
     }
     emit changed();
 }
@@ -355,7 +435,11 @@ void Flow::reset() {
     ++m_run;
     m_poll.stop();
     m_again.stop();
+    m_patience.stop();
     m_failures = 0;
+    m_unplayed = 0;
+    m_stalled = false;
+    m_trouble.clear();
     if (!m_job.isEmpty())
         cancelJob(m_job);
     m_job.clear();
