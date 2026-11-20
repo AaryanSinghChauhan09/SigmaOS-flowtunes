@@ -433,13 +433,16 @@ ApplicationWindow {
                 objectName: "detail"
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
+                // A name from a file is shown as it's written, and as much of it as fits.
+                textFormat: Text.PlainText
+                elide: Text.ElideMiddle
                 font.pixelSize: 15
                 color: win.muted
-                // What's known of the tune: which one it is, its tempo and its key.
+                // What's known of the tune: its name, its tempo and its key.
                 text: {
                     if (win.flow.track.toString() === "")
                         return " "
-                    const parts = [qsTr("Tune %L1").arg(win.flow.number)]
+                    const parts = [win.flow.title]
                     if (win.flow.bpm > 0)
                         parts.push(qsTr("%L1 BPM").arg(win.flow.bpm))
                     if (win.flow.key !== "")
