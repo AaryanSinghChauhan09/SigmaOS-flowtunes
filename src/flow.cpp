@@ -81,8 +81,9 @@ void Flow::play(const QString &genre) {
 }
 
 void Flow::gather() {
-    // The tunes made before play first, in a new order every time. Any file
-    // not named as a sung one counts as music alone.
+    // The tunes made before play first, in a new order every time: with
+    // lyrics on, every file but those named as instrumental, and with
+    // lyrics off, only those.
     const QDir tunes(folder(m_genre));
     for (const QString &tune : tunes.entryList({"*.mp3"}, QDir::Files))
         if (sungOf(tune) == m_lyrics && tunes.filePath(tune) != m_current.path)
@@ -126,8 +127,6 @@ QString Flow::folder(const QString &genre) const { return m_musicFolder + "/" + 
 
 QString Flow::fileName(const QDateTime &when, int bpm, const QString &key, bool lyrics) {
     QString name = when.toString("yyyyMMdd-HHmmss");
-    if (lyrics)
-        name += "-lyrics";
     if (bpm > 0)
         name += QString("-%1bpm").arg(bpm);
     // A key as the model says it, "F# minor", with nothing a file name can't hold.
@@ -135,22 +134,30 @@ QString Flow::fileName(const QDateTime &when, int bpm, const QString &key, bool 
     const QString plain = QString(key).replace(unfit, "-");
     if (!plain.isEmpty() && plain != "-")
         name += "-" + plain;
-    return name + ".mp3";
+    return name + (lyrics ? "" : "-instrumental") + ".mp3";
 }
 
 int Flow::bpmOf(const QString &fileName) {
-    static const QRegularExpression tempo("^\\d{8}-\\d{6}(?:-lyrics)?-(\\d+)bpm");
+    static const QRegularExpression tempo("^\\d{8}-\\d{6}-(\\d+)bpm");
     return tempo.match(fileName).captured(1).toInt();
 }
 
 QString Flow::keyOf(const QString &fileName) {
-    static const QRegularExpression key("^\\d{8}-\\d{6}(?:-lyrics)?(?:-\\d+bpm)?-([A-G][A-Za-z0-9#-]*?)(?:_\\d+)?\\.mp3$");
+    static const QRegularExpression key("^\\d{8}-\\d{6}(?:-\\d+bpm)?-([A-G][A-Za-z0-9#-]*?)(?:-instrumental)?(?:_\\d+)?\\.mp3$");
     return key.match(fileName).captured(1).replace('-', ' ');
 }
 
+int Flow::sungLines(const QString &lyrics) {
+    int sung = 0;
+    for (const QString &line : lyrics.split('\n'))
+        if (!line.trimmed().isEmpty() && !line.trimmed().startsWith('['))
+            ++sung;
+    return sung;
+}
+
 bool Flow::sungOf(const QString &fileName) {
-    static const QRegularExpression sung("^\\d{8}-\\d{6}-lyrics[-_.]");
-    return sung.match(fileName).hasMatch();
+    static const QRegularExpression played("-instrumental(?:_\\d+)?\\.mp3$");
+    return !played.match(fileName).hasMatch();
 }
 
 void Flow::retry() {
@@ -235,13 +242,23 @@ void Flow::compose() {
     const bool sung = m_lyrics;
     submit("/lm", {{"caption", Genres::caption(m_genre, *QRandomGenerator::global(), sung)},
                    {"lyrics", sung ? "" : "[Instrumental]"}, {"duration", trackSeconds},
-                   {"vocal_language", m_language.section('-', 0, 0)}},
+                   {"vocal_language", m_language.isEmpty() ? QString("en") : m_language.section('-', 0, 0)}},
            [this, sung](const QByteArray &written) {
         const QJsonObject song = QJsonDocument::fromJson(written).array().first().toObject();
         if (song.isEmpty()) {
             fail(tr("The tune couldn't be made"));
             return;
         }
+        // Whether a tune is sung is the model's to decide, whatever it's
+        // asked, so one written without words is written again.
+        if (sung && sungLines(song.value("lyrics").toString()) < 2) {
+            if (++m_unsung < lyricsTries)
+                compose();
+            else
+                fail(tr("The model wrote no lyrics"));
+            return;
+        }
+        m_unsung = 0;
         Track track;
         track.made = true;
         track.bpm = song.value("bpm").toInt();
@@ -449,6 +466,7 @@ void Flow::fail(const QString &error) {
         cancelJob(m_job);
     m_job.clear();
     m_poll.stop();
+    m_unsung = 0;
     m_trouble = error;
     // Once more by itself, starting the model again if it has stopped. A
     // second failure in a row is the user's to see, unless a tune is
@@ -472,6 +490,7 @@ void Flow::reset() {
     m_patience.stop();
     m_failures = 0;
     m_unplayed = 0;
+    m_unsung = 0;
     m_stalled = false;
     m_trouble.clear();
     if (!m_job.isEmpty())

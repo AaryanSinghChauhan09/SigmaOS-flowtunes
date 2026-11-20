@@ -384,8 +384,9 @@ ApplicationWindow {
                 readonly property bool checked: win.flow.lyrics
                 readonly property color ink: checked ? theme.accent : win.muted
                 Layout.alignment: Qt.AlignHCenter
-                Layout.topMargin: 2
-                Layout.bottomMargin: 4
+                // Tucked up under the name, inside the room its tall letters leave.
+                Layout.topMargin: -12
+                Layout.bottomMargin: 8
                 implicitWidth: lyricsRow.implicitWidth + 16
                 implicitHeight: 24
                 opacity: lyricsHover.hovered || checked ? 1 : 0.75

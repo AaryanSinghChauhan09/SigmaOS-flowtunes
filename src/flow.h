@@ -90,11 +90,18 @@ public:
     // `waveBars` levels from 0 to 1, out of its sound as 16-bit mono samples.
     static QVariantList shapeOf(const QByteArray &samples);
     static constexpr int waveBars = 96;
-    // A tune's file name: when it was made, that it's sung when it is, then
-    // its tempo and key when the model said them, which is where they're
-    // read back from.
+    // A tune's file name: when it was made, then its tempo and key when the
+    // model said them, which is where they're read back from, and
+    // `-instrumental` at its end when nobody sings in it. A file without
+    // that ending, whoever made it, counts as sung.
     static QString fileName(const QDateTime &when, int bpm, const QString &key, bool lyrics = false);
     static bool sungOf(const QString &fileName);
+    // How many lines of a written-out song are words to sing, rather than
+    // its parts' names in brackets.
+    static int sungLines(const QString &lyrics);
+    // The model asked for lyrics doesn't always write any, so it's asked
+    // again, this many times at most for one tune.
+    static constexpr int lyricsTries = 6;
     static int bpmOf(const QString &fileName);
     static QString keyOf(const QString &fileName);
 
@@ -143,6 +150,8 @@ private:
     QString m_trouble;
     // Tunes that couldn't be played in a row.
     int m_unplayed = 0;
+    // Times in a row the model wrote a tune with no words when asked for some.
+    int m_unsung = 0;
     // The model was asked to start and stayed stopped.
     bool m_stalled = false;
 

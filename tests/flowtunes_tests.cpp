@@ -184,6 +184,9 @@ struct FakeServer : QObject {
     QByteArray sound;
     bool held = false;
     bool broken = false;
+    // How many songs asked for with lyrics it writes without any first.
+    int shy = 0;
+    QHash<QString, bool> worded;
     int jobs = 0;
     QHash<QString, QString> kinds;
 
@@ -223,6 +226,8 @@ struct FakeServer : QObject {
         if (method == "POST" && (path == "/lm" || path == "/synth")) {
             const QString id = QString::number(++jobs);
             kinds[id] = path;
+            // Left without lyrics, it's the model that writes them.
+            worded[id] = path == "/lm" && bodies.last().value("lyrics").toString().isEmpty() && shy-- <= 0;
             return "{\"id\":\"" + id.toLatin1() + "\"}";
         }
         const QString id = QUrlQuery(QUrl(path).query()).queryItemValue("id");
@@ -230,6 +235,9 @@ struct FakeServer : QObject {
             return "{}";
         if (!path.contains("result=1"))
             return broken ? "{\"status\":\"failed\"}" : held ? "{\"status\":\"running\"}" : "{\"status\":\"done\"}";
+        if (worded.value(id))
+            return QJsonDocument(QJsonArray{QJsonObject{{"caption", "written out"}, {"lyrics", "[Verse]\nLa la la\nOh la la\n[Chorus]\nLa"},
+                                                        {"bpm", 88}, {"keyscale", "C minor"}, {"audio_codes", "1,2,3"}}}).toJson();
         if (kinds.value(id) == "/lm")
             return R"([{"caption":"written out","lyrics":"[Instrumental]","bpm":88,"keyscale":"C minor","audio_codes":"1,2,3"}])";
         return "--ace-batch-boundary\r\nContent-Type: audio/mpeg\r\n\r\n" + sound + "\r\n--ace-batch-boundary--\r\n";
@@ -300,7 +308,10 @@ private slots:
             QVERIFY2(captions.size() > 5, qPrintable(genre.id));
         }
         QVERIFY(Genres::caption("polka", random).isEmpty());
-        QVERIFY(Genres::caption("jazz", random, true).endsWith(", with vocals"));
+        QVERIFY(Genres::caption("jazz", random, true).startsWith("vocal jazz song"));
+        QVERIFY(!Genres::caption("jazz", random, true).contains("instrumental"));
+        QCOMPARE(Flow::sungLines("[Intro]\n\n[Instrumental]"), 0);
+        QCOMPARE(Flow::sungLines("[Verse]\nOne line\n And another\n\n[Chorus]\nA third"), 3);
     }
 
     void modelsFindTheMusicModel() {
@@ -467,7 +478,7 @@ private slots:
         // genre's own folder.
         const QString first = flow.track().toLocalFile();
         QCOMPARE(QFileInfo(first).absolutePath(), dir.path() + "/music/Jazz");
-        QVERIFY(QFileInfo(first).fileName().endsWith("-88bpm-C-minor.mp3"));
+        QVERIFY(QFileInfo(first).fileName().endsWith("-88bpm-C-minor-instrumental.mp3"));
         flow.next();
         QCOMPARE(flow.number(), 2);
         QVERIFY(flow.track().toLocalFile() != first);
@@ -640,9 +651,11 @@ private slots:
         QVERIFY(QDir().mkpath(flow.folder("jazz")));
         QVERIFY(write(flow.folder("jazz") + "/empty.mp3", ""));
         QVERIFY(write(flow.folder("jazz") + "/not music.mp3", "words, not sound"));
-        // Anything in the genre's folder plays, whoever put it there.
+        // Anything in the genre's folder plays, whoever put it there. A file
+        // not named as instrumental plays with the lyrics on.
         QVERIFY(write(flow.folder("jazz") + "/a song of my own.mp3", m_tone));
 
+        flow.setLyrics(true);
         flow.play("jazz");
         QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
         QCOMPARE(QFileInfo(flow.track().toLocalFile()).fileName(), QString("a song of my own.mp3"));
@@ -697,7 +710,8 @@ private slots:
         QCOMPARE(flow.folder("dnb"), dir.path() + "/music/Drum & Bass");
         QVERIFY(QDir().mkpath(flow.folder("dnb")));
         QVERIFY(QDir().mkpath(flow.folder("jazz")));
-        const QStringList before{"20260101-100000-174bpm-F#-minor.mp3", "20260101-100500.mp3", "20260101-101000-170bpm.mp3"};
+        const QStringList before{"20260101-100000-174bpm-F#-minor-instrumental.mp3", "20260101-100500-instrumental.mp3",
+                                 "20260101-101000-170bpm-instrumental.mp3"};
         for (const QString &name : before)
             QVERIFY(write(flow.folder("dnb") + "/" + name, m_tone));
         QVERIFY(write(flow.folder("jazz") + "/20260101-100000.mp3", m_tone));
@@ -739,7 +753,7 @@ private slots:
             Flow flow(&models, dir.path() + "/music");
             QVERIFY(!flow.lyrics());
             QVERIFY(QDir().mkpath(flow.folder("jazz")));
-            QVERIFY(write(flow.folder("jazz") + "/20260101-100000-lyrics-90bpm.mp3", m_tone));
+            QVERIFY(write(flow.folder("jazz") + "/20260101-100000-90bpm.mp3", m_tone));
             flow.setProperty("language", "da");
             flow.play("jazz");
             // Music alone to begin with: the sung tune from before is left out.
@@ -750,17 +764,21 @@ private slots:
 
             // With lyrics, the tune playing stays, and what's behind it is sung:
             // the one from before first, then ones the model writes words for.
+            // The model doesn't always write words when asked: it's asked
+            // again until it does, and only then is the tune rendered.
+            server.shy = 2;
             flow.setLyrics(true);
             QCOMPARE(flow.track(), playing);
             QCOMPARE(flow.number(), 1);
             QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") == 4 && !flow.composing(), 10000);
+            QCOMPARE(server.count("POST /lm"), 6);
             const QJsonObject asked = server.bodies[server.requests.lastIndexOf("POST /lm")];
             QCOMPARE(asked.value("lyrics").toString(), QString());
             QCOMPARE(asked.value("vocal_language").toString(), QString("da"));
-            QVERIFY(asked.value("caption").toString().endsWith(", with vocals"));
+            QVERIFY(asked.value("caption").toString().startsWith("vocal jazz song"));
             flow.next();
             QCOMPARE(flow.number(), 2);
-            QCOMPARE(flow.track().fileName(), QString("20260101-100000-lyrics-90bpm.mp3"));
+            QCOMPARE(flow.track().fileName(), QString("20260101-100000-90bpm.mp3"));
             flow.next();
             QVERIFY(Flow::sungOf(flow.track().fileName()));
             QVERIFY(flow.error().isEmpty());
@@ -772,24 +790,27 @@ private slots:
 
     void aTuneIsNamedForWhenItWasMadeAndHowItSounds() {
         const QDateTime when(QDate(2026, 11, 20), QTime(14, 5, 9));
-        QCOMPARE(Flow::fileName(when, 88, "C minor"), QString("20261120-140509-88bpm-C-minor.mp3"));
-        QCOMPARE(Flow::fileName(when, 0, ""), QString("20261120-140509.mp3"));
-        QCOMPARE(Flow::fileName(when, 120, "F# major"), QString("20261120-140509-120bpm-F#-major.mp3"));
+        QCOMPARE(Flow::fileName(when, 88, "C minor", true), QString("20261120-140509-88bpm-C-minor.mp3"));
+        QCOMPARE(Flow::fileName(when, 0, "", true), QString("20261120-140509.mp3"));
+        QCOMPARE(Flow::fileName(when, 120, "F# major", true), QString("20261120-140509-120bpm-F#-major.mp3"));
         // Nothing of a key can leave its folder.
-        QCOMPARE(Flow::fileName(when, 0, "../x"), QString("20261120-140509--x.mp3"));
+        QCOMPARE(Flow::fileName(when, 0, "../x", true), QString("20261120-140509--x.mp3"));
         QCOMPARE(Flow::bpmOf("20261120-140509-88bpm-C-minor.mp3"), 88);
         QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor.mp3"), QString("C minor"));
         QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor_2.mp3"), QString("C minor"));
         QCOMPARE(Flow::keyOf("20261120-140509-A-major.mp3"), QString("A major"));
         QCOMPARE(Flow::keyOf("20261120-140509-88bpm.mp3"), QString());
-        // A sung tune says so in its name.
-        QCOMPARE(Flow::fileName(when, 88, "C minor", true), QString("20261120-140509-lyrics-88bpm-C-minor.mp3"));
-        QCOMPARE(Flow::bpmOf("20261120-140509-lyrics-88bpm-C-minor.mp3"), 88);
-        QCOMPARE(Flow::keyOf("20261120-140509-lyrics-88bpm-C-minor.mp3"), QString("C minor"));
-        QVERIFY(Flow::sungOf("20261120-140509-lyrics-88bpm-C-minor.mp3"));
-        QVERIFY(Flow::sungOf("20261120-140509-lyrics.mp3"));
-        QVERIFY(!Flow::sungOf("20261120-140509-88bpm-C-minor.mp3"));
-        QVERIFY(!Flow::sungOf("lyrics of my own.mp3"));
+        // A tune nobody sings in says so at the end of its name.
+        QCOMPARE(Flow::fileName(when, 88, "C minor"), QString("20261120-140509-88bpm-C-minor-instrumental.mp3"));
+        QCOMPARE(Flow::fileName(when, 0, ""), QString("20261120-140509-instrumental.mp3"));
+        QCOMPARE(Flow::bpmOf("20261120-140509-88bpm-C-minor-instrumental.mp3"), 88);
+        QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor-instrumental.mp3"), QString("C minor"));
+        QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor-instrumental_2.mp3"), QString("C minor"));
+        QCOMPARE(Flow::keyOf("20261120-140509-88bpm-instrumental.mp3"), QString());
+        QVERIFY(!Flow::sungOf("20261120-140509-88bpm-C-minor-instrumental.mp3"));
+        QVERIFY(!Flow::sungOf("20261120-140509-instrumental_2.mp3"));
+        QVERIFY(Flow::sungOf("20261120-140509-88bpm-C-minor.mp3"));
+        QVERIFY(Flow::sungOf("a song of my own.mp3"));
         QCOMPARE(Flow::bpmOf("a song of my own.mp3"), 0);
         QCOMPARE(Flow::keyOf("a song of my own.mp3"), QString());
     }
