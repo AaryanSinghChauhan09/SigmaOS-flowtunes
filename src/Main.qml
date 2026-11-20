@@ -378,15 +378,54 @@ ApplicationWindow {
                 text: win.genreNames[win.flow.genre] || ""
             }
             // Sung, or only played: what the tunes made from here on are.
-            Switch {
+            Item {
+                id: lyricsSwitch
                 objectName: "lyrics"
+                readonly property bool checked: win.flow.lyrics
+                readonly property color ink: checked ? theme.accent : win.muted
                 Layout.alignment: Qt.AlignHCenter
-                focusPolicy: Qt.NoFocus
-                text: qsTr("Lyrics")
-                checked: win.flow.lyrics
-                onToggled: win.flow.lyrics = checked
-                ToolTip.visible: hovered
-                ToolTip.text: text + "  L"
+                Layout.topMargin: 2
+                Layout.bottomMargin: 4
+                implicitWidth: lyricsRow.implicitWidth + 16
+                implicitHeight: 24
+                opacity: lyricsHover.hovered || checked ? 1 : 0.75
+
+                Row {
+                    id: lyricsRow
+                    anchors.centerIn: parent
+                    spacing: 7
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 22
+                        height: 12
+                        radius: 6
+                        color: "transparent"
+                        border.width: 1
+                        border.color: lyricsSwitch.ink
+                        Rectangle {
+                            x: lyricsSwitch.checked !== win.rightToLeft ? parent.width - width - 3 : 3
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 6
+                            height: 6
+                            radius: 3
+                            color: lyricsSwitch.ink
+                            Behavior on x { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+                        }
+                    }
+                    Label {
+                        anchors.verticalCenter: parent.verticalCenter
+                        font.pixelSize: 13
+                        color: lyricsSwitch.ink
+                        text: qsTr("Lyrics")
+                    }
+                }
+                HoverHandler { id: lyricsHover; cursorShape: Qt.PointingHandCursor }
+                TapHandler { onTapped: win.flow.lyrics = !win.flow.lyrics }
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: qsTr("Lyrics")
+                Accessible.checked: checked
+                ToolTip.visible: lyricsHover.hovered
+                ToolTip.text: qsTr("Lyrics") + "  L"
                 ToolTip.delay: 300
             }
             Label {
