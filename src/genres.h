@@ -25,6 +25,6 @@ bool has(const QString &id);
 QString name(const QString &id);
 // What the music model is asked for: the genre's sound with two of its
 // turns, always without a voice, since words pull at attention.
-QString caption(const QString &id, QRandomGenerator &random);
+QString caption(const QString &id, QRandomGenerator &random, bool lyrics = false);
 
 } // namespace Genres

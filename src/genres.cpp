@@ -62,14 +62,14 @@ QString name(const QString &id) {
     return {};
 }
 
-QString caption(const QString &id, QRandomGenerator &random) {
+QString caption(const QString &id, QRandomGenerator &random, bool lyrics) {
     for (const Genre &genre : all()) {
         if (genre.id != id)
             continue;
         const int first = random.bounded(genre.turns.size());
         // Any turn but the first one again.
         const int second = (first + 1 + random.bounded(genre.turns.size() - 1)) % genre.turns.size();
-        return QString("%1, %2, %3, instrumental").arg(genre.sound, genre.turns[first], genre.turns[second]);
+        return QString("%1, %2, %3, %4").arg(genre.sound, genre.turns[first], genre.turns[second], lyrics ? "with vocals" : "instrumental");
     }
     return {};
 }

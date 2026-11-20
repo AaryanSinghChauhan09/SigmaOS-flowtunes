@@ -20,6 +20,7 @@
   "Genres": "Genres",
   "Jazz": "Jazz",
   "Lo-fi": "Lo-fi",
+  "Lyrics": "Lyrics",
   "Move between the genres": "Move between the genres",
   "Next": "Next",
   "No music model fits this machine yet": "No music model fits this machine yet",
@@ -49,6 +50,7 @@
   "The tune couldn't be played: %1": "The tune couldn't be played: %1",
   "Try again": "Try again",
   "Tune %L1": "Tune %L1",
+  "Turn the lyrics on or off": "Turn the lyrics on or off",
   "What do you want to flow to?": "What do you want to flow to?",
   "omarchy-agent-local couldn't be run": "omarchy-agent-local couldn't be run"
 }

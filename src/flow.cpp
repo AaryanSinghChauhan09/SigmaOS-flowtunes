@@ -45,6 +45,7 @@ Flow::Flow(Models *models, const QString &musicFolder, QObject *parent)
     m_again.setSingleShot(true);
     connect(&m_again, &QTimer::timeout, this, [this] { pump(); });
     connect(m_models, &Models::changed, this, [this] { pump(); });
+    m_lyrics = QSettings().value("lyrics", false).toBool();
     // A model that takes its start and then stays stopped says nothing more,
     // so it's given a while and then called what it is.
     m_patience.setSingleShot(true);
@@ -74,11 +75,34 @@ void Flow::play(const QString &genre) {
     reset();
     m_genre = genre;
     QSettings().setValue("genre", genre);
-    // The tunes made before play first, in a new order every time.
-    const QDir tunes(folder(genre));
+    gather();
+    emit changed();
+    pump();
+}
+
+void Flow::gather() {
+    // The tunes made before play first, in a new order every time. Any file
+    // not named as a sung one counts as music alone.
+    const QDir tunes(folder(m_genre));
     for (const QString &tune : tunes.entryList({"*.mp3"}, QDir::Files))
-        m_library << tunes.filePath(tune);
+        if (sungOf(tune) == m_lyrics && tunes.filePath(tune) != m_current.path)
+            m_library << tunes.filePath(tune);
     std::shuffle(m_library.begin(), m_library.end(), *QRandomGenerator::global());
+}
+
+void Flow::setLyrics(bool lyrics) {
+    if (lyrics == m_lyrics)
+        return;
+    m_lyrics = lyrics;
+    QSettings().setValue("lyrics", lyrics);
+    if (!m_genre.isEmpty()) {
+        const Track playing = m_current;
+        const int number = m_number;
+        reset();
+        m_current = playing;
+        m_number = number;
+        gather();
+    }
     emit changed();
     pump();
 }
@@ -100,8 +124,10 @@ void Flow::next() {
 
 QString Flow::folder(const QString &genre) const { return m_musicFolder + "/" + Genres::name(genre); }
 
-QString Flow::fileName(const QDateTime &when, int bpm, const QString &key) {
+QString Flow::fileName(const QDateTime &when, int bpm, const QString &key, bool lyrics) {
     QString name = when.toString("yyyyMMdd-HHmmss");
+    if (lyrics)
+        name += "-lyrics";
     if (bpm > 0)
         name += QString("-%1bpm").arg(bpm);
     // A key as the model says it, "F# minor", with nothing a file name can't hold.
@@ -113,13 +139,18 @@ QString Flow::fileName(const QDateTime &when, int bpm, const QString &key) {
 }
 
 int Flow::bpmOf(const QString &fileName) {
-    static const QRegularExpression tempo("^\\d{8}-\\d{6}-(\\d+)bpm");
+    static const QRegularExpression tempo("^\\d{8}-\\d{6}(?:-lyrics)?-(\\d+)bpm");
     return tempo.match(fileName).captured(1).toInt();
 }
 
 QString Flow::keyOf(const QString &fileName) {
-    static const QRegularExpression key("^\\d{8}-\\d{6}(?:-\\d+bpm)?-([A-G][A-Za-z0-9#-]*?)(?:_\\d+)?\\.mp3$");
+    static const QRegularExpression key("^\\d{8}-\\d{6}(?:-lyrics)?(?:-\\d+bpm)?-([A-G][A-Za-z0-9#-]*?)(?:_\\d+)?\\.mp3$");
     return key.match(fileName).captured(1).replace('-', ' ');
+}
+
+bool Flow::sungOf(const QString &fileName) {
+    static const QRegularExpression sung("^\\d{8}-\\d{6}-lyrics[-_.]");
+    return sung.match(fileName).hasMatch();
 }
 
 void Flow::retry() {
@@ -200,9 +231,12 @@ void Flow::compose() {
     emit changed();
     // The model's language model writes the tune out first: how it sounds,
     // its tempo and key, and its notes, which go back to be rendered as they are.
-    submit("/lm", {{"caption", Genres::caption(m_genre, *QRandomGenerator::global())},
-                   {"lyrics", "[Instrumental]"}, {"duration", trackSeconds}, {"vocal_language", "en"}},
-           [this](const QByteArray &written) {
+    // Left without lyrics it writes its own, in the language asked for.
+    const bool sung = m_lyrics;
+    submit("/lm", {{"caption", Genres::caption(m_genre, *QRandomGenerator::global(), sung)},
+                   {"lyrics", sung ? "" : "[Instrumental]"}, {"duration", trackSeconds},
+                   {"vocal_language", m_language.section('-', 0, 0)}},
+           [this, sung](const QByteArray &written) {
         const QJsonObject song = QJsonDocument::fromJson(written).array().first().toObject();
         if (song.isEmpty()) {
             fail(tr("The tune couldn't be made"));
@@ -212,7 +246,7 @@ void Flow::compose() {
         track.made = true;
         track.bpm = song.value("bpm").toInt();
         track.key = song.value("keyscale").toString();
-        submit("/synth", song, [this, track](const QByteArray &rendered) mutable {
+        submit("/synth", song, [this, track, sung](const QByteArray &rendered) mutable {
             // Parts between lines of a boundary, which the first line is:
             // the MP3 is the first part's body.
             const QByteArray boundary = "\r\n" + rendered.left(rendered.indexOf("\r\n"));
@@ -225,7 +259,7 @@ void Flow::compose() {
             // Among the genre's tunes, under a name none of them has, and
             // whole or not at all.
             const QString tunes = folder(m_genre);
-            QString name = fileName(QDateTime::currentDateTime(), track.bpm, track.key);
+            QString name = fileName(QDateTime::currentDateTime(), track.bpm, track.key, sung);
             for (int copy = 2; QFile::exists(tunes + "/" + name); ++copy)
                 name = name.section('.', 0, -2).section('_', 0, 0) + QString("_%1.mp3").arg(copy);
             track.path = tunes + "/" + name;

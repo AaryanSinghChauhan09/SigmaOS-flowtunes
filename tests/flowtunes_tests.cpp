@@ -300,6 +300,7 @@ private slots:
             QVERIFY2(captions.size() > 5, qPrintable(genre.id));
         }
         QVERIFY(Genres::caption("polka", random).isEmpty());
+        QVERIFY(Genres::caption("jazz", random, true).endsWith(", with vocals"));
     }
 
     void modelsFindTheMusicModel() {
@@ -728,6 +729,47 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(QDir(flow.folder("dnb")).entryList({"*.mp3"}, QDir::Files).size() >= 5, 10000);
     }
 
+    void lyricsChangeWhatIsMadeAndPlayedFromTheNextTuneOn() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        {
+            Flow flow(&models, dir.path() + "/music");
+            QVERIFY(!flow.lyrics());
+            QVERIFY(QDir().mkpath(flow.folder("jazz")));
+            QVERIFY(write(flow.folder("jazz") + "/20260101-100000-lyrics-90bpm.mp3", m_tone));
+            flow.setProperty("language", "da");
+            flow.play("jazz");
+            // Music alone to begin with: the sung tune from before is left out.
+            QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") == 3 && !flow.composing(), 10000);
+            const QUrl playing = flow.track();
+            QVERIFY(!Flow::sungOf(playing.fileName()));
+            QCOMPARE(server.bodies[server.requests.indexOf("POST /lm")].value("lyrics").toString(), QString("[Instrumental]"));
+
+            // With lyrics, the tune playing stays, and what's behind it is sung:
+            // the one from before first, then ones the model writes words for.
+            flow.setLyrics(true);
+            QCOMPARE(flow.track(), playing);
+            QCOMPARE(flow.number(), 1);
+            QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") == 4 && !flow.composing(), 10000);
+            const QJsonObject asked = server.bodies[server.requests.lastIndexOf("POST /lm")];
+            QCOMPARE(asked.value("lyrics").toString(), QString());
+            QCOMPARE(asked.value("vocal_language").toString(), QString("da"));
+            QVERIFY(asked.value("caption").toString().endsWith(", with vocals"));
+            flow.next();
+            QCOMPARE(flow.number(), 2);
+            QCOMPARE(flow.track().fileName(), QString("20260101-100000-lyrics-90bpm.mp3"));
+            flow.next();
+            QVERIFY(Flow::sungOf(flow.track().fileName()));
+            QVERIFY(flow.error().isEmpty());
+        }
+        // And it's remembered.
+        Flow later(&models, dir.path() + "/music");
+        QVERIFY(later.lyrics());
+    }
+
     void aTuneIsNamedForWhenItWasMadeAndHowItSounds() {
         const QDateTime when(QDate(2026, 11, 20), QTime(14, 5, 9));
         QCOMPARE(Flow::fileName(when, 88, "C minor"), QString("20261120-140509-88bpm-C-minor.mp3"));
@@ -740,6 +782,14 @@ private slots:
         QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor_2.mp3"), QString("C minor"));
         QCOMPARE(Flow::keyOf("20261120-140509-A-major.mp3"), QString("A major"));
         QCOMPARE(Flow::keyOf("20261120-140509-88bpm.mp3"), QString());
+        // A sung tune says so in its name.
+        QCOMPARE(Flow::fileName(when, 88, "C minor", true), QString("20261120-140509-lyrics-88bpm-C-minor.mp3"));
+        QCOMPARE(Flow::bpmOf("20261120-140509-lyrics-88bpm-C-minor.mp3"), 88);
+        QCOMPARE(Flow::keyOf("20261120-140509-lyrics-88bpm-C-minor.mp3"), QString("C minor"));
+        QVERIFY(Flow::sungOf("20261120-140509-lyrics-88bpm-C-minor.mp3"));
+        QVERIFY(Flow::sungOf("20261120-140509-lyrics.mp3"));
+        QVERIFY(!Flow::sungOf("20261120-140509-88bpm-C-minor.mp3"));
+        QVERIFY(!Flow::sungOf("lyrics of my own.mp3"));
         QCOMPARE(Flow::bpmOf("a song of my own.mp3"), 0);
         QCOMPARE(Flow::keyOf("a song of my own.mp3"), QString());
     }
@@ -1020,6 +1070,15 @@ private slots:
         QCOMPARE(playPause->property("text").toString(), QString("Play"));
         QTest::keyClick(window, Qt::Key_Space);
         QVERIFY(!window->property("paused").toBool());
+
+        // L turns the lyrics on and off, as the switch under the genre shows.
+        auto *lyrics = item(playing, "lyrics");
+        QVERIFY(!lyrics->property("checked").toBool());
+        QTest::keyClick(window, Qt::Key_L);
+        QVERIFY(backend.flow()->lyrics());
+        QVERIFY(lyrics->property("checked").toBool());
+        QTest::keyClick(window, Qt::Key_L);
+        QVERIFY(!backend.flow()->lyrics());
 
         // `flowtunes <genre>` asks for a genre to play from the start; here none was.
         QCOMPARE(window->property("picking").toBool(), false);

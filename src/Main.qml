@@ -122,6 +122,9 @@ ApplicationWindow {
     Shortcut { sequence: "Down"; enabled: win.choosing; onActivated: win.move(tiles.columns) }
     Shortcut { sequence: "N"; enabled: !win.choosing; onActivated: win.flow.next() }
     Shortcut { sequence: "G"; enabled: !win.choosing; onActivated: win.picking = true }
+    Shortcut { sequence: "L"; enabled: !win.choosing; onActivated: win.flow.lyrics = !win.flow.lyrics }
+    // The lyrics are sung in the language the desktop speaks.
+    Binding { target: win.flow; property: "language"; value: translator.language }
     Shortcut {
         sequence: "Escape"
         enabled: win.flow.genre !== "" && !help.opened
@@ -374,6 +377,18 @@ ApplicationWindow {
                 font.weight: Font.Bold
                 text: win.genreNames[win.flow.genre] || ""
             }
+            // Sung, or only played: what the tunes made from here on are.
+            Switch {
+                objectName: "lyrics"
+                Layout.alignment: Qt.AlignHCenter
+                focusPolicy: Qt.NoFocus
+                text: qsTr("Lyrics")
+                checked: win.flow.lyrics
+                onToggled: win.flow.lyrics = checked
+                ToolTip.visible: hovered
+                ToolTip.text: text + "  L"
+                ToolTip.delay: 300
+            }
             Label {
                 objectName: "detail"
                 Layout.fillWidth: true
@@ -496,6 +511,7 @@ ApplicationWindow {
                     { keys: "Space", action: qsTr("Pause or play") },
                     { keys: "N", action: qsTr("Skip to the next tune") },
                     { keys: "G", action: qsTr("Pick another genre") },
+                    { keys: "L", action: qsTr("Turn the lyrics on or off") },
                     { keys: "?", action: qsTr("Show or hide the shortcuts") },
                     { keys: "Q", action: qsTr("Quit") }
                 ]

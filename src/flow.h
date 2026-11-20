@@ -34,6 +34,10 @@ class Flow : public QObject {
     // Which tune of this flow it is, from 1.
     Q_PROPERTY(int number READ number NOTIFY changed)
     Q_PROPERTY(bool composing READ composing NOTIFY changed)
+    // Whether the tunes are sung, with lyrics the model writes, or only played.
+    Q_PROPERTY(bool lyrics READ lyrics WRITE setLyrics NOTIFY changed)
+    // The language they're sung in.
+    Q_PROPERTY(QString language MEMBER m_language)
     // Why there's nothing to play. While a tune plays, trouble making the
     // next one is tried again quietly, and said only once the music runs out.
     Q_PROPERTY(QString error READ error NOTIFY changed)
@@ -52,6 +56,10 @@ public:
     QString key() const { return m_current.key; }
     int number() const { return m_number; }
     bool composing() const { return m_composing; }
+    bool lyrics() const { return m_lyrics; }
+    // Changes what the flow plays from the next tune on: the one playing
+    // stays, and those ready behind it give way to the other kind.
+    void setLyrics(bool lyrics);
     QString error() const { return m_error; }
     // Where a genre's tunes are.
     QString folder(const QString &genre) const;
@@ -82,9 +90,11 @@ public:
     // `waveBars` levels from 0 to 1, out of its sound as 16-bit mono samples.
     static QVariantList shapeOf(const QByteArray &samples);
     static constexpr int waveBars = 96;
-    // A tune's file name: when it was made, then its tempo and key when the
-    // model said them, which is where they're read back from.
-    static QString fileName(const QDateTime &when, int bpm, const QString &key);
+    // A tune's file name: when it was made, that it's sung when it is, then
+    // its tempo and key when the model said them, which is where they're
+    // read back from.
+    static QString fileName(const QDateTime &when, int bpm, const QString &key, bool lyrics = false);
+    static bool sungOf(const QString &fileName);
     static int bpmOf(const QString &fileName);
     static QString keyOf(const QString &fileName);
 
@@ -119,6 +129,8 @@ private:
     void fail(const QString &error);
     // Drops everything of the flow in hand: its job, its queue, its error.
     void reset();
+    // Finds the genre's tunes from before, of the kind being played.
+    void gather();
 
     Models *m_models;
     QString m_musicFolder;
@@ -135,6 +147,8 @@ private:
     bool m_stalled = false;
 
     QString m_genre;
+    bool m_lyrics = false;
+    QString m_language = "en";
     Track m_current;
     QList<Track> m_queue;
     // The genre's tunes from before that this flow hasn't played yet.

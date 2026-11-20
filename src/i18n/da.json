@@ -20,6 +20,7 @@
   "Genres": "Genrer",
   "Jazz": "Jazz",
   "Lo-fi": "Lo-fi",
+  "Lyrics": "Sangtekster",
   "Move between the genres": "Flyt mellem genrerne",
   "Next": "Næste",
   "No music model fits this machine yet": "Ingen musikmodel passer til denne maskine endnu",
@@ -49,6 +50,7 @@
   "The tune couldn't be played: %1": "Nummeret kunne ikke afspilles: %1",
   "Try again": "Prøv igen",
   "Tune %L1": "Nummer %L1",
+  "Turn the lyrics on or off": "Slå sangtekster til eller fra",
   "What do you want to flow to?": "Hvad vil du flowe til?",
   "omarchy-agent-local couldn't be run": "omarchy-agent-local kunne ikke køres"
 }
