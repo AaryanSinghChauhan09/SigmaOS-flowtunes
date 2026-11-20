@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Flowtunes
+Comment=Endless music in the genre you pick
+Comment[da]=Endeløs musik i den genre, du vælger
+Exec=flowtunes
+Icon=flowtunes
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=flowtunes

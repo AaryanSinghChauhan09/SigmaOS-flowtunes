@@ -1,0 +1,11 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="Aurora.qml">Aurora.qml</file>
+        <file alias="Wave.qml">Wave.qml</file>
+        <file alias="TunePlayer.qml">TunePlayer.qml</file>
+        <file alias="flowtunes.svg">../share/flowtunes.svg</file>
+        <file alias="i18n/en.json">i18n/en.json</file>
+        <file alias="i18n/da.json">i18n/da.json</file>
+    </qresource>
+</RCC>

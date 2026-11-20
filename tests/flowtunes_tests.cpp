@@ -1,0 +1,934 @@
+#include <QDir>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocalServer>
+#include <QLocalSocket>
+#include <QProcess>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickItem>
+#include <QQuickStyle>
+#include <QQuickWindow>
+#include <QRandomGenerator>
+#include <QRegularExpression>
+#include <QSettings>
+#include <QStandardPaths>
+#include <QTcpServer>
+#include <QTcpSocket>
+#include <QTemporaryDir>
+#include <QUrlQuery>
+#include <QtEndian>
+#include <QtTest>
+#include <memory>
+
+#include "backend.h"
+#include "flow.h"
+#include "genres.h"
+#include "models.h"
+#include "theme.h"
+#include "translator.h"
+
+namespace {
+
+bool write(const QString &path, const QByteArray &contents) {
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly) && file.write(contents) == contents.size();
+}
+
+int lines(const QString &path) {
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? file.readAll().count('\n') : 0;
+}
+
+// The window's item with this objectName. What a Repeater, ListView or Loader
+// makes isn't a QObject child of the window, so findChild never finds it; walk
+// the items instead. Popups aren't items: find those with findChild.
+QQuickItem *item(QQuickItem *from, const QString &name) {
+    for (auto *child : from->childItems()) {
+        if (child->objectName() == name)
+            return child;
+        if (auto *found = item(child, name))
+            return found;
+    }
+    return nullptr;
+}
+
+// A hyprctl that answers with response.json beside it and counts its calls.
+QString fakeHyprctl(const QString &directory) {
+    const QString command = directory + "/hyprctl";
+    write(command, "#!/bin/bash\necho >> '" + directory.toUtf8() + "/calls'\ncat '" + directory.toUtf8()
+                       + "/response.json'\n");
+    QFile::setPermissions(command, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return command;
+}
+
+QJsonObject readCatalog(const QString &path) {
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject();
+}
+
+// The placeholders in a text, sorted: %1 to %99, and the count (%n, %Ln).
+QStringList placeholders(const QString &text) {
+    static const QRegularExpression placeholder("%L?(?:[1-9][0-9]?|n)");
+    QStringList found;
+    for (auto it = placeholder.globalMatch(text); it.hasNext();)
+        found << it.next().captured();
+    found.sort();
+    return found;
+}
+
+// Every text the sources hand to qsTr() or tr(), and whether a call passes it
+// a count. It walks the code a token at a time, so a string never hides a
+// comment or the other way round, C++'s adjacent literals join, and QML's
+// single quotes count. A text that isn't a literal can't be in a catalog.
+QMap<QString, bool> translatables(const QString &folder, QStringList *problems) {
+    QMap<QString, bool> found;
+    for (const QFileInfo &info : QDir(folder).entryInfoList({"*.qml", "*.js", "*.cpp", "*.h"}, QDir::Files)) {
+        QFile file(info.filePath());
+        if (!file.open(QIODevice::ReadOnly))
+            continue;
+        const QString code = QString::fromUtf8(file.readAll());
+        qsizetype i = 0;
+        auto literal = [&](QString *text) {
+            const QChar quote = code[i++];
+            for (; i < code.size() && code[i] != quote; ++i) {
+                if (code[i] == '\\' && i + 1 < code.size()) {
+                    const QChar escaped = code[++i];
+                    const int digits = escaped == 'u' ? 4 : escaped == 'x' ? 2 : 0;
+                    bool hex = false;
+                    const ushort unit = code.mid(i + 1, digits).toUShort(&hex, 16);
+                    if (digits && hex) {
+                        *text += QChar(unit);
+                        i += digits;
+                    } else {
+                        *text += escaped == 'n' ? QChar('\n') : escaped == 't' ? QChar('\t') : escaped;
+                    }
+                } else {
+                    *text += code[i];
+                }
+            }
+            ++i;
+        };
+        auto skipSpace = [&] {
+            while (i < code.size() && code[i].isSpace())
+                ++i;
+        };
+        while (i < code.size()) {
+            const QChar c = code[i];
+            if (code.mid(i, 2) == "//") {
+                i = code.indexOf('\n', i);
+                if (i < 0)
+                    break;
+            } else if (code.mid(i, 2) == "/*") {
+                i = code.indexOf("*/", i + 2);
+                if (i < 0)
+                    break;
+                i += 2;
+            } else if (c == '"' || c == '\'') {
+                QString skipped;
+                literal(&skipped);
+            } else if (c.isLetter() || c == '_') {
+                const qsizetype start = i;
+                while (i < code.size() && (code[i].isLetterOrNumber() || code[i] == '_'))
+                    ++i;
+                const QString word = code.mid(start, i - start);
+                skipSpace();
+                if ((word != "qsTr" && word != "tr") || i >= code.size() || code[i] != '(')
+                    continue;
+                ++i;
+                skipSpace();
+                if (i >= code.size() || (code[i] != '"' && code[i] != '\'')) {
+                    *problems << info.fileName() + ": not a literal: " + code.mid(start, 40);
+                    continue;
+                }
+                QString text;
+                do {
+                    literal(&text);
+                    skipSpace();
+                } while (i < code.size() && code[i] == '"');
+                // The arguments after the text, to the call's closing parenthesis.
+                int depth = 0, commas = 0;
+                while (i < code.size()) {
+                    const QChar d = code[i];
+                    if (d == '"' || d == '\'') {
+                        QString skipped;
+                        literal(&skipped);
+                        continue;
+                    }
+                    if (d == '(' || d == '[' || d == '{')
+                        ++depth;
+                    else if ((d == ')' || d == ']' || d == '}') && depth-- == 0)
+                        break;
+                    else if (d == ',' && depth == 0)
+                        ++commas;
+                    ++i;
+                }
+                found[text] = found.value(text) || commas >= 2;
+            } else {
+                ++i;
+            }
+        }
+    }
+    return found;
+}
+
+// A music model's server: it takes the jobs Flowtunes hands it, remembers
+// every request, and answers a job's result with a written-out song or a
+// rendered MP3. `held` keeps jobs running, and `broken` fails them.
+struct FakeServer : QObject {
+    QTcpServer server;
+    QStringList requests;
+    QList<QJsonObject> bodies;
+    QByteArray sound;
+    bool held = false;
+    bool broken = false;
+    int jobs = 0;
+    QHash<QString, QString> kinds;
+
+    FakeServer() {
+        server.listen(QHostAddress::LocalHost);
+        connect(&server, &QTcpServer::newConnection, this, [this] {
+            while (QTcpSocket *socket = server.nextPendingConnection()) {
+                auto buffer = std::make_shared<QByteArray>();
+                connect(socket, &QTcpSocket::readyRead, socket, [this, socket, buffer] {
+                    *buffer += socket->readAll();
+                    const qsizetype end = buffer->indexOf("\r\n\r\n");
+                    if (end < 0)
+                        return;
+                    const QList<QByteArray> head = buffer->left(end).split('\n');
+                    qsizetype length = 0;
+                    for (const QByteArray &line : head)
+                        if (line.toLower().startsWith("content-length:"))
+                            length = line.mid(15).trimmed().toLongLong();
+                    if (buffer->size() < end + 4 + length)
+                        return;
+                    const QList<QByteArray> request = head.first().split(' ');
+                    const QString method = request.value(0), path = request.value(1);
+                    requests << method + " " + path;
+                    bodies << QJsonDocument::fromJson(buffer->mid(end + 4, length)).object();
+                    const QByteArray body = answer(method, path);
+                    socket->write("HTTP/1.1 200 OK\r\nContent-Length: " + QByteArray::number(body.size())
+                                  + "\r\nConnection: close\r\n\r\n" + body);
+                    socket->disconnectFromHost();
+                    buffer->clear();
+                });
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+            }
+        });
+    }
+
+    QByteArray answer(const QString &method, const QString &path) {
+        if (method == "POST" && (path == "/lm" || path == "/synth")) {
+            const QString id = QString::number(++jobs);
+            kinds[id] = path;
+            return "{\"id\":\"" + id.toLatin1() + "\"}";
+        }
+        const QString id = QUrlQuery(QUrl(path).query()).queryItemValue("id");
+        if (path.contains("cancel=1"))
+            return "{}";
+        if (!path.contains("result=1"))
+            return broken ? "{\"status\":\"failed\"}" : held ? "{\"status\":\"running\"}" : "{\"status\":\"done\"}";
+        if (kinds.value(id) == "/lm")
+            return R"([{"caption":"written out","lyrics":"[Instrumental]","bpm":88,"keyscale":"C minor","audio_codes":"1,2,3"}])";
+        return "--ace-batch-boundary\r\nContent-Type: audio/mpeg\r\n\r\n" + sound + "\r\n--ace-batch-boundary--\r\n";
+    }
+
+    int count(const QString &request) const { return requests.count(request); }
+    QString origin() const { return QString("http://127.0.0.1:%1").arg(server.serverPort()); }
+};
+
+// An engine state folder with one music model in `unit` at `origin`, and a key.
+void engineWith(const QString &folder, const QString &unit, const QString &origin) {
+    QDir().mkpath(folder);
+    write(folder + "/status.json", QJsonDocument(QJsonObject{{"models", QJsonObject{{"ace-step", QJsonObject{
+        {"kind", "music"}, {"name", "ACE-Step 1.5 Turbo"}, {"unit", unit}, {"endpoint", origin + "/v1"}}}}}}).toJson());
+    write(folder + "/list.json", "[]");
+    write(folder + "/key", "secret\n");
+}
+
+// A second of a real MP3, as the model would render one.
+QByteArray tone() {
+    QProcess ffmpeg;
+    ffmpeg.start("ffmpeg", {"-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-f", "mp3", "-"});
+    ffmpeg.waitForFinished();
+    return ffmpeg.readAllStandardOutput();
+}
+
+// A stand-in for omarchy-agent-local that notes what it was asked.
+QString fakeEngine(const QString &folder) {
+    const QString path = folder + "/engine";
+    write(path, "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/asked\"\n");
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return path;
+}
+
+} // namespace
+
+class FlowtunesTests : public QObject {
+    Q_OBJECT
+
+private slots:
+    void initTestCase() {
+        QQuickStyle::setStyle("Material");
+        // The genre played last is remembered in the settings: never the user's own.
+        QStandardPaths::setTestModeEnabled(true);
+        QCoreApplication::setOrganizationName("flowtunes");
+        QCoreApplication::setApplicationName("flowtunes");
+        m_tone = tone();
+        QVERIFY(m_tone.size() > 1000);
+    }
+
+    void init() { QSettings().clear(); }
+
+    void everyGenreAsksForItsOwnSoundWithoutAVoice() {
+        const QStringList ids = Genres::ids();
+        QCOMPARE(ids.size(), 12);
+        QCOMPARE(QSet<QString>(ids.begin(), ids.end()).size(), 12);
+        QRandomGenerator random(7);
+        for (const Genre &genre : Genres::all()) {
+            QSet<QString> captions;
+            for (int i = 0; i < 20; ++i) {
+                const QString caption = Genres::caption(genre.id, random);
+                QVERIFY(caption.startsWith(genre.sound));
+                QVERIFY(caption.endsWith(", instrumental"));
+                captions << caption;
+            }
+            // One tune is asked for differently from the next.
+            QVERIFY2(captions.size() > 5, qPrintable(genre.id));
+        }
+        QVERIFY(Genres::caption("polka", random).isEmpty());
+    }
+
+    void modelsFindTheMusicModel() {
+        const auto status = [](const QString &kind, const QString &unit) {
+            return QJsonObject{{"models", QJsonObject{{"m", QJsonObject{{"kind", kind}, {"name", "M"}, {"unit", unit},
+                                                                       {"endpoint", "http://127.0.0.1:1/v1"}}}}}};
+        };
+        QCOMPARE(Models::discover({}, {}, false).state, QString("noEngine"));
+        QCOMPARE(Models::discover({}, {}, true).state, QString("none"));
+        QCOMPARE(Models::discover(status("music", "active"), {}, true).state, QString("ready"));
+        QCOMPARE(Models::discover(status("music", "activating"), {}, true).state, QString("starting"));
+        QCOMPARE(Models::discover(status("music", "inactive"), {}, true).state, QString("installed"));
+        QCOMPARE(Models::discover(status("music", "installing"), {}, true).state, QString("installing"));
+        // An image model is no use here.
+        QCOMPARE(Models::discover(status("image", "active"), {}, true).state, QString("none"));
+
+        const QJsonArray list{QJsonObject{{"id", "z"}, {"kind", "image"}, {"available", true}},
+                              QJsonObject{{"id", "a"}, {"kind", "music"}, {"name", "A"}, {"available", false}, {"reason", "no GPU"}},
+                              QJsonObject{{"id", "b"}, {"kind", "music"}, {"name", "B"}, {"available", true}}};
+        const Models::Discovery offered = Models::discover({}, list, true);
+        QCOMPARE(offered.state, QString("installable"));
+        QCOMPARE(offered.name, QString("B"));
+        const Models::Discovery unfit = Models::discover({}, QJsonArray{list[0], list[1]}, true);
+        QCOMPARE(unfit.state, QString("none"));
+        QCOMPARE(unfit.reason, QString("no GPU"));
+    }
+
+    void modelsFollowTheEngine() {
+        QTemporaryDir dir;
+        engineWith(dir.path(), "inactive", "http://127.0.0.1:1");
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        QCOMPARE(models.state(), QString("installed"));
+        QCOMPARE(models.key(), QByteArray("secret"));
+
+        models.start();
+        QTRY_VERIFY(!models.working());
+        QFile asked(dir.path() + "/asked");
+        QVERIFY(asked.open(QIODevice::ReadOnly));
+        QCOMPARE(asked.readAll(), QByteArray("start ace-step\n"));
+
+        engineWith(dir.path(), "active", "http://127.0.0.1:1");
+        QTRY_COMPARE(models.state(), QString("ready"));
+        QCOMPARE(models.origin(), QString("http://127.0.0.1:1"));
+    }
+
+    void aFlowKeepsTwoTunesAhead() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+
+        flow.play("polka");
+        QVERIFY(flow.genre().isEmpty());
+        flow.play("jazz");
+        QCOMPARE(flow.genre(), QString("jazz"));
+        QVERIFY(flow.composing());
+        QVERIFY(flow.track().isEmpty());
+
+        // The first tune plays, and the two after it are made behind it.
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+        QCOMPARE(flow.number(), 1);
+        QCOMPARE(flow.bpm(), 88);
+        QCOMPARE(flow.key(), QString("C minor"));
+        QCOMPARE(flow.wave().size(), Flow::waveBars);
+        QVERIFY(QFile::exists(flow.track().toLocalFile()));
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /synth") == 3 && !flow.composing(), 10000);
+        // And no more than that until the music moves on.
+        QTest::qWait(700);
+        QCOMPARE(server.count("POST /lm"), 3);
+
+        // Asked for as its genre, without a voice, at a tune's length; the
+        // song the model wrote goes back to be rendered as it is.
+        QVERIFY(server.bodies[server.requests.indexOf("POST /lm")].value("caption").toString().startsWith("smooth jazz"));
+        QCOMPARE(server.bodies[server.requests.indexOf("POST /lm")].value("lyrics").toString(), QString("[Instrumental]"));
+        QCOMPARE(server.bodies[server.requests.indexOf("POST /lm")].value("duration").toInt(), Flow::trackSeconds);
+        QCOMPARE(server.bodies[server.requests.indexOf("POST /synth")].value("audio_codes").toString(), QString("1,2,3"));
+
+        // On to the next, and another is made. Every tune stays, in the
+        // genre's own folder.
+        const QString first = flow.track().toLocalFile();
+        QCOMPARE(QFileInfo(first).absolutePath(), dir.path() + "/music/Jazz");
+        QVERIFY(QFileInfo(first).fileName().endsWith("-88bpm-C-minor.mp3"));
+        flow.next();
+        QCOMPARE(flow.number(), 2);
+        QVERIFY(flow.track().toLocalFile() != first);
+        QVERIFY(QFile::exists(first));
+        QTRY_COMPARE_WITH_TIMEOUT(server.count("POST /synth"), 4, 10000);
+        QCOMPARE(QSettings().value("genre").toString(), QString("jazz"));
+        QCOMPARE(flow.lastGenre(), QString("jazz"));
+    }
+
+    void aSkipPastTheLastTuneWaitsForTheNext() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.play("lofi");
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+        server.held = true;
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("POST /lm") == 2 || !flow.composing(), 10000);
+        flow.next();
+        flow.next();
+        QVERIFY(flow.track().isEmpty());
+        QVERIFY(flow.error().isEmpty());
+        server.held = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+    }
+
+    void anotherGenreDropsTheTuneBeingMade() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        server.held = true;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.play("techno");
+        QTRY_VERIFY_WITH_TIMEOUT(server.count("GET /job?id=1") > 0, 10000);
+
+        flow.play("ambient");
+        QTRY_COMPARE_WITH_TIMEOUT(server.count("POST /job?id=1&cancel=1"), 1, 10000);
+        server.held = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+        QCOMPARE(flow.genre(), QString("ambient"));
+        QCOMPARE(flow.number(), 1);
+        QVERIFY(server.bodies[server.requests.lastIndexOf("POST /lm")].value("caption").toString().startsWith("ambient"));
+
+        // Stopping drops the tune being made.
+        server.held = true;
+        QTRY_VERIFY_WITH_TIMEOUT(flow.composing(), 10000);
+        const int cancels = server.requests.filter("cancel=1").size();
+        flow.stop();
+        QVERIFY(flow.genre().isEmpty());
+        QVERIFY(flow.track().isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(server.requests.filter("cancel=1").size(), cancels + 1, 10000);
+    }
+
+    void aTuneThatFailsStopsTheFlowUntilAskedAgain() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        server.broken = true;
+        engineWith(dir.path(), "active", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.play("dnb");
+        QTRY_COMPARE_WITH_TIMEOUT(flow.error(), QString("The tune couldn't be made"), 10000);
+        QVERIFY(!flow.composing());
+        // It doesn't try again by itself.
+        QTest::qWait(700);
+        QCOMPARE(server.count("POST /lm"), 1);
+
+        server.broken = false;
+        flow.retry();
+        QVERIFY(flow.error().isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+
+        // A tune that can't be played stops the flow too, and says why.
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.composing(), 10000);
+        flow.playbackFailed("no sound card");
+        QCOMPARE(flow.error(), QString("The tune couldn't be played: no sound card"));
+        QVERIFY(flow.track().isEmpty());
+        flow.retry();
+        QVERIFY(!flow.track().isEmpty());
+    }
+
+    void aModelThatDoesNotAnswerIsSaid() {
+        QTemporaryDir dir;
+        // Nothing listens there.
+        engineWith(dir.path(), "active", "http://127.0.0.1:9");
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.play("jazz");
+        QTRY_VERIFY_WITH_TIMEOUT(flow.error().startsWith("The music model didn't answer: "), 10000);
+    }
+
+    void aStoppedModelIsStartedForTheFlow() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path(), "inactive", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        flow.play("classical");
+        QTRY_VERIFY(QFile::exists(dir.path() + "/asked"));
+        QTRY_VERIFY(!models.working());
+        // Asked once, however often the engine's files change meanwhile.
+        engineWith(dir.path(), "activating", server.origin());
+        QTRY_COMPARE(models.state(), QString("starting"));
+        QCOMPARE(lines(dir.path() + "/asked"), 1);
+        QVERIFY(server.requests.isEmpty());
+
+        engineWith(dir.path(), "active", server.origin());
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+    }
+
+    void aGenresTunesFromBeforePlayFirst() {
+        QTemporaryDir dir;
+        FakeServer server;
+        server.sound = m_tone;
+        // The model is set up but stopped: tunes from before need none.
+        engineWith(dir.path(), "inactive", server.origin());
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        Flow flow(&models, dir.path() + "/music");
+        QCOMPARE(flow.folder("dnb"), dir.path() + "/music/Drum & Bass");
+        QVERIFY(QDir().mkpath(flow.folder("dnb")));
+        QVERIFY(QDir().mkpath(flow.folder("jazz")));
+        const QStringList before{"20260101-100000-174bpm-F#-minor.mp3", "20260101-100500.mp3", "20260101-101000-170bpm.mp3"};
+        for (const QString &name : before)
+            QVERIFY(write(flow.folder("dnb") + "/" + name, m_tone));
+        QVERIFY(write(flow.folder("jazz") + "/20260101-100000.mp3", m_tone));
+
+        flow.play("dnb");
+        QStringList played;
+        for (int i = 0; i < 3; ++i) {
+            QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+            const QString name = QFileInfo(flow.track().toLocalFile()).fileName();
+            QCOMPARE(QFileInfo(flow.track().toLocalFile()).absolutePath(), flow.folder("dnb"));
+            QCOMPARE(flow.wave().size(), Flow::waveBars);
+            // Its tempo and key are read back from its name.
+            QCOMPARE(flow.bpm(), name.contains("174") ? 174 : name.contains("170") ? 170 : 0);
+            QCOMPARE(flow.key(), name.contains("174") ? QString("F# minor") : QString());
+            played << name;
+            // None of them asked anything of the model.
+            if (i == 0)
+                QVERIFY(server.requests.isEmpty());
+            flow.next();
+        }
+        played.sort();
+        QCOMPARE(played, before);
+        // Each played once and still there; then the model is started for new ones.
+        QCOMPARE(QDir(flow.folder("dnb")).entryList({"*.mp3"}, QDir::Files).size(), 3);
+        QTRY_VERIFY(QFile::exists(dir.path() + "/asked"));
+        engineWith(dir.path(), "active", server.origin());
+        QTRY_VERIFY_WITH_TIMEOUT(!flow.track().isEmpty(), 10000);
+        QVERIFY(!before.contains(QFileInfo(flow.track().toLocalFile()).fileName()));
+        QTRY_VERIFY_WITH_TIMEOUT(QDir(flow.folder("dnb")).entryList({"*.mp3"}, QDir::Files).size() >= 5, 10000);
+    }
+
+    void aTuneIsNamedForWhenItWasMadeAndHowItSounds() {
+        const QDateTime when(QDate(2026, 11, 20), QTime(14, 5, 9));
+        QCOMPARE(Flow::fileName(when, 88, "C minor"), QString("20261120-140509-88bpm-C-minor.mp3"));
+        QCOMPARE(Flow::fileName(when, 0, ""), QString("20261120-140509.mp3"));
+        QCOMPARE(Flow::fileName(when, 120, "F# major"), QString("20261120-140509-120bpm-F#-major.mp3"));
+        // Nothing of a key can leave its folder.
+        QCOMPARE(Flow::fileName(when, 0, "../x"), QString("20261120-140509--x.mp3"));
+        QCOMPARE(Flow::bpmOf("20261120-140509-88bpm-C-minor.mp3"), 88);
+        QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor.mp3"), QString("C minor"));
+        QCOMPARE(Flow::keyOf("20261120-140509-88bpm-C-minor_2.mp3"), QString("C minor"));
+        QCOMPARE(Flow::keyOf("20261120-140509-A-major.mp3"), QString("A major"));
+        QCOMPARE(Flow::keyOf("20261120-140509-88bpm.mp3"), QString());
+        QCOMPARE(Flow::bpmOf("a song of my own.mp3"), 0);
+        QCOMPARE(Flow::keyOf("a song of my own.mp3"), QString());
+    }
+
+    void aShapeIsHowLoudEachPartIs() {
+        // Quiet for its first half, loud for its second.
+        QByteArray samples;
+        for (int i = 0; i < 9600; ++i) {
+            const qint16 level = qToLittleEndian<qint16>(i < 4800 ? 100 : (i % 2 ? 10000 : -10000));
+            samples.append(reinterpret_cast<const char *>(&level), 2);
+        }
+        const QVariantList shape = Flow::shapeOf(samples);
+        QCOMPARE(shape.size(), Flow::waveBars);
+        QCOMPARE(shape.last().toDouble(), 1.0);
+        QVERIFY(qAbs(shape.first().toDouble() - 0.01) < 0.001);
+        QVERIFY(Flow::shapeOf({}).isEmpty());
+    }
+
+    void themeFallsBack() {
+        QTemporaryDir dir;
+        Theme theme(dir.path());
+        QCOMPARE(theme.accent(), QColor("#FFD60A"));
+        QCOMPARE(theme.accentForeground(), QColor("black"));
+        QVERIFY(!theme.light());
+        QCOMPARE(theme.radius(), 0);
+    }
+
+    void themeReadsThePalette() {
+        QTemporaryDir dir;
+        QVERIFY(QDir(dir.path()).mkpath("theme"));
+        QVERIFY(write(dir.path() + "/theme/colors.toml", "mode = \"light\"\n"
+                                                         "theme_type = \"dark\"\n"
+                                                         "accent = \"#112233\"\n"
+                                                         "bg = #fafafa # paper\n"
+                                                         "foreground = '#202020'\n"
+                                                         "color1 = \"#aa0000\"\n"));
+
+        Theme theme(dir.path());
+        QCOMPARE(theme.accent(), QColor("#112233"));
+        QCOMPARE(theme.accentForeground(), QColor("white"));
+        QCOMPARE(theme.background(), QColor("#fafafa"));
+        QCOMPARE(theme.foreground(), QColor("#202020"));
+        QCOMPARE(theme.colors().value("red").value<QColor>(), QColor("#aa0000"));
+        QVERIFY(theme.light());
+    }
+
+    void themeAsksHyprlandAgainOnlyWhenItReloads() {
+        // The fake Hyprland lives outside the theme directory, whose changes
+        // the Theme also follows.
+        QTemporaryDir dir, hypr;
+        const QString command = fakeHyprctl(hypr.path());
+        QVERIFY(write(hypr.filePath("response.json"), "{\"int\":4}"));
+        QLocalServer events;
+        QVERIFY(events.listen(hypr.filePath("events.sock")));
+
+        // Once on start, and once more when the event socket connects.
+        Theme theme(dir.path(), nullptr, command, events.fullServerName());
+        QTRY_VERIFY(events.hasPendingConnections());
+        QLocalSocket *hyprland = events.nextPendingConnection();
+        QTRY_COMPARE(lines(hypr.filePath("calls")), 2);
+        QTRY_COMPARE(theme.radius(), 4);
+
+        QVERIFY(write(hypr.filePath("response.json"), "{\"int\":10}"));
+        QTest::qWait(300);
+        QCOMPARE(lines(hypr.filePath("calls")), 2);
+        // Events arrive in pieces; only a whole configreloaded line counts.
+        hyprland->write("activewindow>>kitty,~\nconfigrel");
+        hyprland->flush();
+        QTest::qWait(100);
+        QCOMPARE(lines(hypr.filePath("calls")), 2);
+        hyprland->write("oaded>>\n");
+        QTRY_COMPARE(theme.radius(), 10);
+        QCOMPARE(lines(hypr.filePath("calls")), 3);
+    }
+
+    void themeReachesHyprlandOnceItListens() {
+        QTemporaryDir dir, hypr;
+        const QString command = fakeHyprctl(hypr.path());
+        QVERIFY(write(hypr.filePath("response.json"), "{\"int\":4}"));
+        Theme theme(dir.path(), nullptr, command, hypr.filePath("events.sock"));
+        QTRY_COMPARE(theme.radius(), 4);
+
+        QVERIFY(write(hypr.filePath("response.json"), "{\"int\":8}"));
+        QLocalServer events;
+        QVERIFY(events.listen(hypr.filePath("events.sock")));
+        QTRY_VERIFY_WITH_TIMEOUT(events.hasPendingConnections(), 5000);
+        QTRY_COMPARE(theme.radius(), 8);
+    }
+
+    void translatorFallsBackToEnglish() {
+        QTemporaryDir dir;
+        Translator translator(dir.path() + "/language", dir.path());
+        QCOMPARE(translator.language(), QString("en"));
+        QVERIFY(translator.translate("Main", "Save").isNull());
+    }
+
+    void translatorFollowsTheLanguageFile() {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.path() + "/language", "pt-BR\n"));
+        QVERIFY(write(dir.path() + "/pt.json", R"({"Save": "Guardar", "Open": "Abrir"})"));
+        QVERIFY(write(dir.path() + "/pt-BR.json", R"({"Save": "Salvar"})"));
+
+        Translator translator(dir.path() + "/language", dir.path());
+        QCOMPARE(translator.language(), QString("pt-BR"));
+        QCOMPARE(translator.translate("Main", "Save"), QString("Salvar"));
+        QCOMPARE(translator.translate("Main", "Open"), QString("Abrir"));
+        QVERIFY(translator.translate("Main", "Quit").isNull());
+    }
+
+    void translatorSeesAFirstPick() {
+        // Before the first pick there is no ~/.config/omarchy to watch.
+        QTemporaryDir dir;
+        QVERIFY(write(dir.path() + "/da.json", R"({"Save": "Gem"})"));
+        Translator translator(dir.path() + "/omarchy/language", dir.path());
+        QVERIFY(QDir(dir.path()).mkpath("omarchy"));
+        QVERIFY(write(dir.path() + "/omarchy/language", "da\n"));
+        QTRY_COMPARE(translator.translate("Main", "Save"), QString("Gem"));
+    }
+
+    void translatorPicksPluralForms() {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.path() + "/language", "ru\n"));
+        QVERIFY(write(dir.path() + "/en.json", R"({"%n clips": {"one": "%n clip", "other": "%n clips"},
+                                                   "%n files": {"one": "%n file", "other": "%n files"}})"));
+        QVERIFY(write(dir.path() + "/ru.json", R"({"%n clips": {"one": "%n клип", "few": "%n клипа", "many": "%n клипов", "other": "%n клипа"}})"));
+
+        Translator translator(dir.path() + "/language", dir.path());
+        QCOMPARE(translator.translate("Main", "%n clips", nullptr, 21), QString("%n клип"));
+        QCOMPARE(translator.translate("Main", "%n clips", nullptr, 22), QString("%n клипа"));
+        QCOMPARE(translator.translate("Main", "%n clips", nullptr, 25), QString("%n клипов"));
+        // An untranslated counted string falls back to English, with English rules.
+        QCOMPARE(translator.translate("Main", "%n files", nullptr, 21), QString("%n files"));
+    }
+
+    void englishCatalogListsEveryString() {
+        // en.json is what translators work from: every text the sources
+        // translate is in it, as itself or, when counted, as its English
+        // plural forms, and nothing else is.
+        const QString sources = QFileInfo(QFINDTESTDATA("../src/Main.qml")).absolutePath();
+        QStringList problems;
+        const QMap<QString, bool> used = translatables(sources, &problems);
+        const QJsonObject english = readCatalog(sources + "/i18n/en.json");
+        for (auto it = used.begin(); it != used.end(); ++it) {
+            const QJsonValue value = english.value(it.key());
+            if (value.isUndefined())
+                problems << "missing from en.json: " + it.key();
+            else if (it.value() && (value.toObject().keys() != QStringList{"one", "other"}
+                                    || value.toObject().value("other").toString() != it.key()))
+                problems << "counted, so needs its one and other forms: " + it.key();
+            else if (!it.value() && value.toString() != it.key())
+                problems << "should be itself: " + it.key();
+        }
+        for (const QString &key : english.keys())
+            if (!used.contains(key))
+                problems << "in en.json but no source translates it: " + key;
+        QVERIFY2(problems.isEmpty(), qPrintable(problems.join('\n')));
+    }
+
+    void catalogsMatchTheEnglishOne() {
+        // A catalog may lack a string (it shows in English meanwhile), but what
+        // it has translates something in en.json, with the same placeholders,
+        // and a counted string has every form its language uses.
+        const QString folder = QFileInfo(QFINDTESTDATA("../src/i18n/en.json")).absolutePath();
+        const QJsonObject english = readCatalog(folder + "/en.json");
+        QStringList problems;
+        for (const QFileInfo &file : QDir(folder).entryInfoList({"*.json"}, QDir::Files)) {
+            const QString code = file.completeBaseName();
+            const QJsonObject catalog = readCatalog(file.filePath());
+            if (catalog.isEmpty())
+                problems << code + ": not a JSON object, or empty";
+            // Some languages reach a form only at a million ("many" in French).
+            QSet<QString> categories{"other", Translator::pluralCategory(code, 1000000)};
+            for (long long n = 0; n <= 1000; ++n)
+                categories << Translator::pluralCategory(code, n);
+            for (auto it = catalog.begin(); it != catalog.end(); ++it) {
+                const QString where = code + ": " + it.key() + ": ";
+                const QJsonValue source = english.value(it.key());
+                if (source.isUndefined()) {
+                    problems << where + "not in en.json";
+                } else if (source.isString()) {
+                    if (!it.value().isString() || it.value().toString().isEmpty())
+                        problems << where + "needs a translation";
+                    else if (placeholders(it.value().toString()) != placeholders(it.key()))
+                        problems << where + "has other placeholders than the English";
+                } else {
+                    const QJsonObject forms = it.value().toObject();
+                    const QStringList wanted = placeholders(source.toObject().value("other").toString());
+                    for (const QString &category : categories)
+                        if (forms.value(category).toString().isEmpty())
+                            problems << where + "needs its " + category + " form";
+                    // A form other than "other" may say its number in words.
+                    for (auto form = forms.begin(); form != forms.end(); ++form) {
+                        const QStringList has = placeholders(form.value().toString());
+                        QStringList needed = wanted;
+                        if (form.key() != "other")
+                            needed.removeIf([&](const QString &p) { return p.endsWith('n') && !has.contains(p); });
+                        if (has != needed)
+                            problems << where + form.key() + " has other placeholders than the English";
+                    }
+                }
+            }
+        }
+        QVERIFY2(problems.isEmpty(), qPrintable(problems.join('\n')));
+    }
+
+    void windowPicksAGenreAndPlaysIt() {
+        // A temp language and theme, so the test never depends on the desktop's.
+        QTemporaryDir dir;
+        Translator translator(dir.path() + "/language");
+        QCoreApplication::installTranslator(&translator);
+        Theme theme(dir.path());
+        FakeServer server;
+        server.sound = m_tone;
+        engineWith(dir.path() + "/engine-state", "active", server.origin());
+        Backend backend({dir.path() + "/engine-state", dir.path() + "/engine-state/key", fakeEngine(dir.path()), dir.path() + "/music"});
+
+        QQmlApplicationEngine engine;
+        QStringList warnings;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError> &errors) {
+            for (const auto &error : errors)
+                warnings << error.toString();
+        });
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.load(QUrl("qrc:/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+        QVERIFY(window);
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+
+        // Every genre has a tile with a name of its own.
+        auto *picker = item(window->contentItem(), "picker");
+        auto *playing = item(window->contentItem(), "playing");
+        QVERIFY(picker->isVisible());
+        QVERIFY(!playing->isVisible());
+        QVERIFY(!item(window->contentItem(), "setup")->isVisible());
+        const QVariantMap names = window->property("genreNames").toMap();
+        for (const QString &id : backend.flow()->genres()) {
+            QVERIFY2(item(picker, "genre-" + id), qPrintable(id));
+            QVERIFY2(!names.value(id).toString().isEmpty(), qPrintable(id));
+        }
+
+        // The arrows move between them, and Enter plays the one they're on.
+        QCOMPARE(window->property("chosen").toInt(), 0);
+        QTest::keyClick(window, Qt::Key_Right);
+        QTest::keyClick(window, Qt::Key_Down);
+        QCOMPARE(window->property("chosen").toInt(), 5);
+        QTest::keyClick(window, Qt::Key_Left);
+        QTest::keyClick(window, Qt::Key_Up);
+        QTest::keyClick(window, Qt::Key_Left);
+        QCOMPARE(window->property("chosen").toInt(), 11);
+        QTest::keyClick(window, Qt::Key_Right);
+        QTest::keyClick(window, Qt::Key_Right);
+        QTest::keyClick(window, Qt::Key_Return);
+        QCOMPARE(backend.flow()->genre(), QString("ambient"));
+        QVERIFY(playing->isVisible());
+        QVERIFY(!picker->isVisible());
+        QCOMPARE(item(playing, "genre")->property("text").toString(), QString("Ambient"));
+        QCOMPARE(item(playing, "status")->property("text").toString(), QString("Composing your first tune…"));
+        QVERIFY(item(playing, "wave")->property("forming").toBool());
+
+        // The tune arrives, and plays.
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.flow()->track().isEmpty(), 10000);
+        QTRY_COMPARE(item(playing, "detail")->property("text").toString(), QString("Tune 1  ·  88 BPM  ·  C minor"));
+        QVERIFY(!item(playing, "wave")->property("forming").toBool());
+        QTRY_VERIFY(item(playing, "status")->property("text").toString().contains(" / "));
+
+        // Space pauses and plays; the caption reads on the accent.
+        auto *playPause = item(playing, "playPause");
+        QCOMPARE(playPause->property("text").toString(), QString("Pause"));
+        QCOMPARE(playPause->property("contentItem").value<QQuickItem *>()->property("color").value<QColor>(), theme.accentForeground());
+        QTest::keyClick(window, Qt::Key_Space);
+        QVERIFY(window->property("paused").toBool());
+        QCOMPARE(playPause->property("text").toString(), QString("Play"));
+        QTest::keyClick(window, Qt::Key_Space);
+        QVERIFY(!window->property("paused").toBool());
+
+        // `flowtunes <genre>` asks for a genre to play from the start; here none was.
+        QCOMPARE(window->property("picking").toBool(), false);
+
+        // The one-second tune ends by itself, and the next one plays.
+        QTRY_VERIFY_WITH_TIMEOUT(backend.flow()->number() >= 2, 15000);
+        // And that one plays to its end too: the music flows on by itself.
+        QTRY_VERIFY_WITH_TIMEOUT(backend.flow()->number() >= 4, 15000);
+        // N skips on.
+        const int before = backend.flow()->number();
+        QTRY_VERIFY_WITH_TIMEOUT(!backend.flow()->track().isEmpty(), 10000);
+        QTest::keyClick(window, Qt::Key_N);
+        QVERIFY(backend.flow()->number() > before || backend.flow()->track().isEmpty());
+
+        // Escape shows the genres while the music goes on, and goes back.
+        QTest::keyClick(window, Qt::Key_Escape);
+        QVERIFY(picker->isVisible());
+        QCOMPARE(backend.flow()->genre(), QString("ambient"));
+        QTest::keyClick(window, Qt::Key_Escape);
+        QVERIFY(playing->isVisible());
+        QTest::keyClick(window, Qt::Key_G);
+        QVERIFY(picker->isVisible());
+        // A click on another genre plays that one.
+        auto *jazz = item(picker, "genre-jazz");
+        QTest::mouseClick(window, Qt::LeftButton, {}, jazz->mapToScene(QPointF(jazz->width() / 2, jazz->height() / 2)).toPoint());
+        QTRY_COMPARE(backend.flow()->genre(), QString("jazz"));
+        QVERIFY(playing->isVisible());
+
+        auto *help = window->findChild<QObject *>("help");
+        QTest::keyClick(window, '?');
+        QTRY_VERIFY(help->property("opened").toBool());
+        // A Material popup animates out: `opened` drops at once, `visible` after.
+        QTest::keyClick(window, Qt::Key_Escape);
+        QTRY_VERIFY(!help->property("visible").toBool());
+        QVERIFY(playing->isVisible());
+
+        // Closing the window ends the flow.
+        window->close();
+        QVERIFY(backend.flow()->genre().isEmpty());
+
+        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
+        QCoreApplication::removeTranslator(&translator);
+    }
+
+    void windowOffersToSetUpAModel() {
+        QTemporaryDir dir;
+        Translator translator(dir.path() + "/language");
+        QCoreApplication::installTranslator(&translator);
+        Theme theme(dir.path());
+        const QString state = dir.path() + "/engine-state";
+        QDir().mkpath(state);
+        write(state + "/status.json", "{\"models\":{}}");
+        write(state + "/list.json", R"([{"id":"ace-step","kind":"music","name":"ACE-Step 1.5 Turbo","available":true}])");
+        Backend backend({state, state + "/key", fakeEngine(dir.path()), dir.path() + "/music"});
+
+        QQmlApplicationEngine engine;
+        QStringList warnings;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError> &errors) {
+            for (const auto &error : errors)
+                warnings << error.toString();
+        });
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.load(QUrl("qrc:/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+
+        QVERIFY(item(window->contentItem(), "setup")->isVisible());
+        QVERIFY(!item(window->contentItem(), "picker")->isVisible());
+        // No genre plays without a model, whatever the keyboard says.
+        QTest::keyClick(window, Qt::Key_Return);
+        QVERIFY(backend.flow()->genre().isEmpty());
+
+        auto *setUp = item(window->contentItem(), "setUp");
+        QVERIFY(setUp->isVisible());
+        QTest::mouseClick(window, Qt::LeftButton, {}, setUp->mapToScene(QPointF(setUp->width() / 2, setUp->height() / 2)).toPoint());
+        QTRY_VERIFY(QFile::exists(dir.path() + "/asked"));
+        QFile asked(dir.path() + "/asked");
+        QVERIFY(asked.open(QIODevice::ReadOnly));
+        QCOMPARE(asked.readAll(), QByteArray("use ace-step --detach\n"));
+
+        // Once it's set up and running, the genres are there to pick.
+        engineWith(state, "active", "http://127.0.0.1:9");
+        QTRY_VERIFY(item(window->contentItem(), "picker")->isVisible());
+
+        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
+        QCoreApplication::removeTranslator(&translator);
+    }
+
+private:
+    QByteArray m_tone;
+};
+
+QTEST_MAIN(FlowtunesTests)
+#include "flowtunes_tests.moc"
