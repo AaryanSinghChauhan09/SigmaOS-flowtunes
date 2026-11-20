@@ -914,7 +914,8 @@ private slots:
         // Space pauses and plays; the caption reads on the accent.
         auto *playPause = item(playing, "playPause");
         QCOMPARE(playPause->property("text").toString(), QString("Pause"));
-        QCOMPARE(playPause->property("contentItem").value<QQuickItem *>()->property("color").value<QColor>(), theme.accentForeground());
+        QCOMPARE(playPause->property("ink").value<QColor>(), theme.accentForeground());
+        QCOMPARE(playPause->property("glyph").toString(), QString("pause"));
         QTest::keyClick(window, Qt::Key_Space);
         QVERIFY(window->property("paused").toBool());
         QCOMPARE(playPause->property("text").toString(), QString("Play"));

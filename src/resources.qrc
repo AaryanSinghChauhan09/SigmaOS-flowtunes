@@ -4,6 +4,10 @@
         <file alias="Aurora.qml">Aurora.qml</file>
         <file alias="Wave.qml">Wave.qml</file>
         <file alias="TunePlayer.qml">TunePlayer.qml</file>
+        <file alias="icons/genres.svg">icons/genres.svg</file>
+        <file alias="icons/play.svg">icons/play.svg</file>
+        <file alias="icons/pause.svg">icons/pause.svg</file>
+        <file alias="icons/next.svg">icons/next.svg</file>
         <file alias="flowtunes.svg">../share/flowtunes.svg</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/da.json">i18n/da.json</file>

@@ -156,6 +156,35 @@ ApplicationWindow {
         }
     }
 
+    // A control drawn as its icon alone, named by its tooltip with its key.
+    // The main one sits on a disc of the accent.
+    component IconButton: ToolButton {
+        id: iconButton
+        property string glyph
+        property string key
+        property bool main: false
+        readonly property color ink: main ? theme.accentForeground : hovered ? theme.accent : theme.foreground
+        implicitWidth: main ? 56 : 44
+        implicitHeight: implicitWidth
+        padding: 0
+        focusPolicy: Qt.NoFocus
+        display: AbstractButton.IconOnly
+        icon.source: "qrc:/icons/" + glyph + ".svg"
+        icon.width: main ? 26 : 22
+        icon.height: main ? 26 : 22
+        icon.color: ink
+        opacity: enabled ? 1 : 0.35
+        background: Rectangle {
+            radius: width / 2
+            color: iconButton.main ? theme.accent : "transparent"
+            opacity: iconButton.main && iconButton.hovered ? 0.88 : 1
+        }
+        Accessible.name: text
+        ToolTip.visible: hovered
+        ToolTip.text: text + "  " + key
+        ToolTip.delay: 300
+    }
+
     // Right-to-left languages mirror the window; the Translator sets the
     // application's layout direction.
     Item {
@@ -386,16 +415,22 @@ ApplicationWindow {
             RowLayout {
                 Layout.alignment: Qt.AlignHCenter
                 Layout.topMargin: 14
-                spacing: 8
+                spacing: 20
+                // Play, then next: a tune runs left to right in every language.
+                LayoutMirroring.enabled: false
 
-                FlowButton {
+                IconButton {
                     objectName: "genres"
+                    glyph: "genres"
+                    key: "G"
                     text: qsTr("Genres")
                     onClicked: win.picking = true
                 }
-                FlowButton {
+                IconButton {
                     objectName: "playPause"
-                    highlighted: true
+                    main: true
+                    glyph: win.paused ? "play" : "pause"
+                    key: "Space"
                     visible: win.flow.error === "" && !win.blocked
                     enabled: !win.waiting
                     text: win.paused ? qsTr("Play") : qsTr("Pause")
@@ -408,8 +443,10 @@ ApplicationWindow {
                     text: win.blocked ? qsTr("Stop %1 and start %2").arg(win.models.blockers.join(", ")).arg(win.models.name) : qsTr("Try again")
                     onClicked: win.again()
                 }
-                FlowButton {
+                IconButton {
                     objectName: "next"
+                    glyph: "next"
+                    key: "N"
                     enabled: !win.waiting && win.flow.error === ""
                     text: qsTr("Next")
                     onClicked: win.flow.next()
