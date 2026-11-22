@@ -268,11 +268,13 @@ QByteArray tone() {
     return ffmpeg.readAllStandardOutput();
 }
 
-// A stand-in for omarchy-agent-local that notes what it was asked.
+// A stand-in for omarchy-models that notes what it was asked.
 QString fakeEngine(const QString &folder) {
     const QString path = folder + "/engine";
-    // The refresh every start asks for is beside the point of any test.
-    write(path, "#!/bin/sh\n[ \"$1\" = refresh ] && exit 0\necho \"$@\" >> \"$(dirname \"$0\")/asked\"\n");
+    // The refresh every start asks for, and what the running models hold,
+    // are beside the point of any test that doesn't say otherwise.
+    write(path, "#!/bin/sh\n[ \"$1\" = refresh ] && exit 0\n[ \"$1\" = memory ] && { cat \"$(dirname \"$0\")/held\" 2>/dev/null || echo {}; exit 0; }\n"
+                "echo \"$@\" >> \"$(dirname \"$0\")/asked\"\n");
     QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     return path;
 }
@@ -358,6 +360,69 @@ private slots:
         QCOMPARE(unfit.reason, QString("no GPU"));
     }
 
+    void modelsWeighTheMemoryFree() {
+        // As the engine counts it: what's available and what a GPU driver keeps pooled.
+        const Models::Memory read = Models::memoryOf("MemTotal:       65011712 kB\nMemFree:  1 kB\nMemAvailable:    3145728 kB\nGPUReclaim:      1048576 kB\n");
+        QCOMPARE(read.totalGib, 62.0);
+        QCOMPARE(read.freeGib, 4.0);
+        QCOMPARE(Models::memoryOf("").freeGib, -1.0);
+
+        const auto running = [](const QString &kind, double gib) {
+            return QJsonObject{{"kind", kind}, {"name", kind + " model"}, {"unit", "active"}, {"observed", QJsonObject{{"ram_used_gib", gib}}}};
+        };
+        const QJsonObject status{{"models", QJsonObject{
+            {"ace", QJsonObject{{"kind", "music"}, {"name", "ACE"}, {"unit", "inactive"}, {"fits", true}}},
+            {"qwen", running("text", 40)}, {"flux", running("image", 11)}, {"wan", running("video", 3)},
+            {"far", QJsonObject{{"kind", "text"}, {"unit", "active"}, {"host", "studio"}}}}}};
+        const QJsonArray list{QJsonObject{{"id", "ace"}, {"kind", "music"}, {"available", true}, {"memory_gib", 8}, {"download_gib", 7.5}}};
+        Models::Memory memory;
+        memory.freeGib = 9;
+        Models::Discovery found = Models::discover(status, list, true, memory);
+        QCOMPARE(found.state, QString("installed"));
+        QCOMPARE(found.needGib, 8.0);
+        QCOMPARE(found.diskGib, 7.5);
+        // Every model running here holds memory, whatever its kind, biggest
+        // first; a paired host's holds its own.
+        QCOMPARE(found.holders.size(), 3);
+        QCOMPARE(found.holders.first().toMap().value("name").toString(), QString("text model"));
+
+        // Short by 5: of the models that would make room alone, the smallest
+        // is stopped, leaving the big text model someone's coding with.
+        memory.freeGib = 3;
+        found = Models::discover(status, list, true, memory);
+        QCOMPARE(found.state, QString("blocked"));
+        QCOMPARE(found.blockerIds, QStringList{"flux"});
+        // What the engine measures a model holding now counts over what it
+        // took to load. With none enough alone, the biggest go first.
+        memory.held.insert("qwen", 2);
+        memory.held.insert("flux", 1);
+        found = Models::discover(status, list, true, memory);
+        QCOMPARE(found.blockerIds, (QStringList{"wan", "qwen"}));
+        memory.freeGib = 2;
+        found = Models::discover(status, list, true, memory);
+        QCOMPARE(found.blockerIds, (QStringList{"wan", "qwen", "flux"}));
+        // Stopping them all wouldn't be enough: nothing to offer to stop.
+        memory.held.insert("wan", 1);
+        found = Models::discover(status, list, true, memory);
+        QCOMPARE(found.state, QString("blocked"));
+        QVERIFY(found.blockers.isEmpty());
+    }
+
+    void modelsPlayWithTheOnePicked() {
+        const QJsonObject status{{"models", QJsonObject{
+            {"ace", QJsonObject{{"kind", "music"}, {"name", "ACE"}, {"unit", "active"}}},
+            {"other", QJsonObject{{"kind", "music"}, {"name", "Other"}, {"unit", "inactive"}}}}}};
+        const QJsonArray list{QJsonObject{{"id", "ace"}, {"kind", "music"}, {"available", true}, {"installed", true}},
+                              QJsonObject{{"id", "other"}, {"kind", "music"}, {"available", true}, {"installed", true}},
+                              QJsonObject{{"id", "new"}, {"kind", "music"}, {"name", "New"}, {"available", true}, {"best", true}}};
+        QCOMPARE(Models::discover(status, list, true).id, QString("ace"));
+        QCOMPARE(Models::discover(status, list, true).others.size(), 2);
+        QCOMPARE(Models::discover(status, list, true, {}, "other").id, QString("other"));
+        // One picked that isn't set up yet is offered, over the recommended one.
+        QCOMPARE(Models::discover({}, list, true).id, QString("new"));
+        QCOMPARE(Models::discover({}, list, true, {}, "ace").id, QString("ace"));
+    }
+
     void modelsFollowTheEngine() {
         QTemporaryDir dir;
         engineWith(dir.path(), "inactive", "http://127.0.0.1:1");
@@ -396,6 +461,35 @@ private slots:
         QFile asked(dir.path() + "/asked");
         QVERIFY(asked.open(QIODevice::ReadOnly));
         QCOMPARE(asked.readAll(), QByteArray("stop llm\nstart ace-step\n"));
+    }
+
+    void modelsAreStoppedUpdatedRemovedAndSwapped() {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.path() + "/status.json", QJsonDocument(QJsonObject{{"models", QJsonObject{
+            {"ace", QJsonObject{{"kind", "music"}, {"name", "ACE"}, {"unit", "active"}, {"update", QJsonObject{{"image", true}}}}}}}}).toJson()));
+        QVERIFY(write(dir.path() + "/list.json", R"([{"id":"ace","kind":"music","available":true,"installed":true},
+                                                     {"id":"xl","kind":"music","name":"XL","available":true,"installed":false}])"));
+        // What the running model holds now, as the engine measures it.
+        QVERIFY(write(dir.path() + "/held", R"({"ace": 6.5})"));
+        Models models(dir.path(), dir.path() + "/key", fakeEngine(dir.path()));
+        QTRY_COMPARE(models.heldGib(), 6.5);
+        QVERIFY(models.updatable());
+        const auto asked = [&]() -> QString {
+            QTest::qWaitFor([&] { return !models.working(); });
+            QFile file(dir.path() + "/asked");
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
+        models.update();
+        QCOMPARE(asked(), QString("update ace --detach\n"));
+        models.stop();
+        QCOMPARE(asked(), QString("update ace --detach\nstop ace\n"));
+        models.remove();
+        QCOMPARE(asked(), QString("update ace --detach\nstop ace\nremove ace\n"));
+        // Another music model makes room for itself, and is set up first.
+        QFile::remove(dir.path() + "/asked");
+        models.use("xl");
+        QCOMPARE(asked(), QString("stop ace\nuse xl --detach\n"));
+        QCOMPARE(QSettings().value("model").toString(), QString("xl"));
     }
 
     void aPairedHostsModelServes() {
@@ -1089,7 +1183,7 @@ private slots:
         FakeServer server;
         server.sound = m_tone;
         engineWith(dir.path() + "/engine-state", "active", server.origin());
-        Backend backend({dir.path() + "/engine-state", dir.path() + "/engine-state/key", fakeEngine(dir.path()), dir.path() + "/music"});
+        Backend backend({dir.path() + "/engine-state", dir.path() + "/engine-state/key", fakeEngine(dir.path()), dir.path() + "/music", {}});
 
         QQmlApplicationEngine engine;
         QStringList warnings;
@@ -1299,6 +1393,72 @@ private slots:
         flow.stop();
     }
 
+    void windowSaysWhatHoldsTheMemoryAndMakesRoom() {
+        QTemporaryDir dir;
+        Translator translator(dir.path() + "/language");
+        QCoreApplication::installTranslator(&translator);
+        Theme theme(dir.path());
+        const QString state = dir.path() + "/engine-state";
+        QDir().mkpath(state);
+        const auto running = [](const QString &kind, const QString &name, double gib) {
+            return QJsonObject{{"kind", kind}, {"name", name}, {"unit", "active"}, {"observed", QJsonObject{{"ram_used_gib", gib}}}};
+        };
+        write(state + "/status.json", QJsonDocument(QJsonObject{{"models", QJsonObject{
+            {"ace", QJsonObject{{"kind", "music"}, {"name", "ACE-Step"}, {"unit", "inactive"}, {"endpoint", "http://127.0.0.1:9/v1"}}},
+            {"qwen", running("text", "Qwen", 40)}, {"flux", running("image", "FLUX", 11)}}}}).toJson());
+        write(state + "/list.json", R"([{"id":"ace","kind":"music","available":true,"installed":true,"memory_gib":8,"download_gib":7.5}])");
+        write(dir.path() + "/meminfo", "MemTotal: 67108864 kB\nMemAvailable: 3145728 kB\n");
+        Backend backend({state, state + "/key", fakeEngine(dir.path()), dir.path() + "/music", dir.path() + "/meminfo"});
+
+        QQmlApplicationEngine engine;
+        QStringList warnings;
+        connect(&engine, &QQmlEngine::warnings, this, [&](const QList<QQmlError> &errors) {
+            for (const auto &error : errors)
+                warnings << error.toString();
+        });
+        engine.rootContext()->setContextProperty("translator", &translator);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.load(QUrl("qrc:/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+        QVERIFY(QTest::qWaitForWindowExposed(window));
+        window->requestActivate();
+        QVERIFY(QTest::qWaitForWindowActive(window));
+
+        // Playing says what the model needs, what's free and who has the rest,
+        // and offers to stop the one that's enough.
+        QTest::keyClick(window, Qt::Key_Space);
+        QCOMPARE(backend.models()->state(), QString("blocked"));
+        QCOMPARE(item(window->contentItem(), "status")->property("text").toString(),
+                 QString("ACE-Step needs 8 GB of memory to play, and 3 GB is free."));
+        QCOMPARE(item(window->contentItem(), "holders")->property("text").toString(), QString("Running now: Qwen (40 GB), FLUX (11 GB)"));
+        auto *retry = item(window->contentItem(), "retry");
+        QCOMPARE(retry->property("text").toString(), QString("Stop FLUX and play"));
+        QVERIFY(!QFile::exists(dir.path() + "/asked"));
+        QTest::mouseClick(window, Qt::LeftButton, {}, retry->mapToScene(QPointF(retry->width() / 2, retry->height() / 2)).toPoint());
+        QTRY_VERIFY(!backend.models()->working());
+        QFile asked(dir.path() + "/asked");
+        QVERIFY(asked.open(QIODevice::ReadOnly));
+        QCOMPARE(asked.readAll(), QByteArray("stop flux\nstart ace\n"));
+        asked.close();
+
+        // The sheet removes the model only once asked twice, and stops the music first.
+        QTest::keyClick(window, Qt::Key_M);
+        auto *sheet = window->findChild<QObject *>("sheet");
+        QTRY_VERIFY(sheet->property("opened").toBool());
+        QTest::keyClick(window, Qt::Key_Delete);
+        QVERIFY(sheet->property("removing").toBool());
+        QTest::keyClick(window, Qt::Key_Return);
+        QTRY_VERIFY(!backend.models()->working());
+        QVERIFY(asked.open(QIODevice::ReadOnly));
+        QVERIFY(asked.readAll().endsWith("remove ace\n"));
+        QVERIFY(backend.flow()->genre().isEmpty());
+
+        QVERIFY2(warnings.isEmpty(), qPrintable(warnings.join('\n')));
+        QCoreApplication::removeTranslator(&translator);
+    }
+
     void windowOffersToSetUpAModel() {
         QTemporaryDir dir;
         Translator translator(dir.path() + "/language");
@@ -1308,7 +1468,7 @@ private slots:
         QDir().mkpath(state);
         write(state + "/status.json", "{\"models\":{}}");
         write(state + "/list.json", R"([{"id":"ace-step","kind":"music","name":"ACE-Step 1.5 Turbo","available":true}])");
-        Backend backend({state, state + "/key", fakeEngine(dir.path()), dir.path() + "/music"});
+        Backend backend({state, state + "/key", fakeEngine(dir.path()), dir.path() + "/music", {}});
         // As `flowtunes jazz` starts it.
         backend.setInitialGenre("jazz");
 

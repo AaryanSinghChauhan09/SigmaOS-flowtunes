@@ -47,12 +47,19 @@ ApplicationWindow {
     readonly property bool blocked: waiting && models.state === "blocked" && !models.working
     // What stands in the way of the next tune.
     readonly property string problem: flow.error !== "" ? flow.error : waiting ? models.error : ""
+    // Stops what's in a blocked model's way; with nothing to stop that would
+    // be enough, looks again at what's free, and it starts once it fits.
     function again() {
-        if (blocked)
+        if (blocked && models.blockers.length > 0)
             models.makeRoom()
+        else if (blocked)
+            models.checkMemory()
         else
             flow.retry()
     }
+    // Memory changes hands with nothing to say so: looked at again whenever
+    // the window is.
+    onActiveChanged: if (active) models.checkMemory()
     // The genres are on show: nothing plays yet, or another genre is being picked.
     property bool picking: true
     readonly property bool choosing: picking || flow.genre === ""
@@ -67,6 +74,7 @@ ApplicationWindow {
         chosen = index
         paused = false
         picking = false
+        models.checkMemory()
         flow.play(flow.genres[index])
     }
     function move(by) {
@@ -75,6 +83,35 @@ ApplicationWindow {
     // Written as the language writes numbers, which is why it's handed over.
     function gigabytes(bytes, language) {
         return (bytes / 1e9).toLocaleString(Qt.locale(language), "f", 1)
+    }
+    // Memory and disk as the engine counts them: whole, but to a tenth under ten.
+    function gb(gib, language) {
+        const tenths = Math.round(gib * 10)
+        return gib.toLocaleString(Qt.locale(language), "f", tenths < 100 && tenths % 10 !== 0 ? 1 : 0)
+    }
+    // The other models running here, each with what it holds.
+    function holding(language) {
+        return models.holders.map(held => qsTr("%1 (%2 GB)").arg(held.name).arg(gb(held.gib, language))).join(", ")
+    }
+    // What's left of a model's start, from how long the last one took: steady
+    // to 90% in that time, then creeping on, so a slow one reads as slow, not stuck.
+    function loaded(now) {
+        const expected = models.loadSeconds * 1000
+        const elapsed = now - models.sinceMs
+        if (!(expected > 0) || models.sinceMs <= 0)
+            return 0
+        if (elapsed <= expected)
+            return 0.9 * Math.max(0, elapsed) / expected
+        return 0.9 + 0.08 * (1 - Math.exp(-(elapsed - expected) / expected))
+    }
+    // The clock a start's progress is drawn by, ticking only while one is shown.
+    property real now: Date.now()
+    Timer {
+        interval: 100
+        repeat: true
+        running: win.models.state === "starting" && win.models.loadSeconds > 0
+        onTriggered: win.now = Date.now()
+        onRunningChanged: win.now = Date.now()
     }
     function clock(ms) {
         const seconds = Math.floor(ms / 1000)
@@ -124,6 +161,11 @@ ApplicationWindow {
     onClosing: flow.stop()
 
     Shortcut { sequence: "?"; onActivated: help.opened ? help.close() : help.open() }
+    Shortcut {
+        sequence: "M"
+        enabled: !["noEngine", "none"].includes(win.models.state) && !sheet.opened
+        onActivated: sheet.open()
+    }
     Shortcut { sequence: "Q"; onActivated: win.close() }
     Shortcut {
         sequence: "Space"
@@ -266,6 +308,7 @@ ApplicationWindow {
                 text: win.models.state === "noEngine" ? qsTr("Flowtunes needs Omarchy's local models")
                     : win.models.state === "installable" ? qsTr("Flowtunes plays with %1").arg(win.models.name)
                     : win.models.state === "installing" ? qsTr("Setting up %1…").arg(win.models.name)
+                    : win.models.state === "removing" ? qsTr("Removing %1…").arg(win.models.name)
                     : qsTr("No music model fits this machine yet")
             }
             Label {
@@ -275,23 +318,36 @@ ApplicationWindow {
                 font.pixelSize: 15
                 color: win.muted
                 text: win.models.state === "noEngine" ? qsTr("Flowtunes makes its music with Omarchy's local AI models, which aren't installed.")
+                    : win.models.state === "installable" && win.models.diskGib > 0 && win.models.needGib > 0
+                        ? qsTr("The model makes every tune on this machine. It's a %1 GB download, once, and it needs %2 GB of memory while it plays.")
+                            .arg(win.gb(win.models.diskGib, translator.language)).arg(win.gb(win.models.needGib, translator.language))
                     : win.models.state === "installable" ? qsTr("The model makes every tune on this machine. It's a download of a few gigabytes, once.")
                     : win.models.state === "installing" ? qsTr("The music starts as soon as the model is here.")
+                    : win.models.state === "removing" ? qsTr("Your tunes stay in your music folder.")
                     : qsTr("None of Omarchy's music models runs on this hardware. New ones arrive with updates.")
             }
             ProgressBar {
                 Layout.fillWidth: true
-                visible: win.models.state === "installing"
-                indeterminate: win.models.totalBytes <= 0
+                visible: win.models.state === "installing" || win.models.state === "removing"
+                         || (win.models.state === "installable" && win.models.working)
+                indeterminate: win.models.totalBytes <= 0 || win.models.phase !== "downloading"
                 value: win.models.totalBytes > 0 ? win.models.doneBytes / win.models.totalBytes : 0
             }
             Label {
+                objectName: "setupProgress"
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
                 font.pixelSize: 12
                 color: win.muted
-                visible: win.models.state === "installing" && win.models.totalBytes > 0
-                text: qsTr("%1 of %2 GB").arg(win.gigabytes(win.models.doneBytes, translator.language))
+                visible: text !== ""
+                text: win.models.state === "installable" && win.models.working ? qsTr("Getting ready…")
+                    : win.models.state !== "installing" ? ""
+                    : win.models.phase === "waiting" ? qsTr("Waiting for another model to finish setting up…")
+                    : win.models.totalBytes <= 0 ? ""
+                    : win.models.rateBytes > 0 ? qsTr("%1 of %2 GB").arg(win.gigabytes(win.models.doneBytes, translator.language))
+                                                     .arg(win.gigabytes(win.models.totalBytes, translator.language))
+                                               + "  ·  " + qsTr("%1 MB/s").arg(Math.round(win.models.rateBytes / 1e6).toLocaleString(Qt.locale(translator.language), "f", 0))
+                    : qsTr("%1 of %2 GB").arg(win.gigabytes(win.models.doneBytes, translator.language))
                                          .arg(win.gigabytes(win.models.totalBytes, translator.language))
             }
             FlowButton {
@@ -504,12 +560,43 @@ ApplicationWindow {
                 font.pixelSize: 15
                 color: win.problem !== "" ? theme.colors.red : win.muted
                 text: win.problem !== "" ? win.problem
+                    : win.blocked && win.models.needGib > 0 && win.models.freeGib >= 0
+                        ? qsTr("%1 needs %2 GB of memory to play, and %3 GB is free.").arg(win.models.name)
+                            .arg(win.gb(win.models.needGib, translator.language)).arg(win.gb(win.models.freeGib, translator.language))
                     : win.blocked ? qsTr("%1 needs the memory %2 is using").arg(win.models.name).arg(win.models.blockers.join(", "))
                     : !win.waiting ? win.clock(win.player ? win.player.position : 0) + " / " + win.clock(win.player ? win.player.duration : 0)
-                    : win.models.working || win.models.state === "starting" ? qsTr("Starting %1…").arg(win.models.name)
+                    : win.models.state === "starting" ? qsTr("Loading %1…").arg(win.models.name)
+                    : win.models.working ? qsTr("Starting %1…").arg(win.models.name)
                     : !win.flow.composing ? " "
                     : win.flow.number === 0 ? qsTr("Composing your first tune…")
                     : qsTr("Composing the next tune…")
+            }
+            // What's holding the memory a blocked model needs, and what to do about it.
+            Label {
+                objectName: "holders"
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                font.pixelSize: 13
+                color: win.muted
+                visible: win.blocked && text !== ""
+                text: {
+                    const lines = []
+                    if (win.models.holders.length > 0)
+                        lines.push(qsTr("Running now: %1").arg(win.holding(translator.language)))
+                    if (win.models.blockers.length === 0 && win.models.needGib > win.models.freeGib && win.models.freeGib >= 0)
+                        lines.push(qsTr("Close some apps to free %1 GB more, then try again.")
+                                   .arg(win.gb(win.models.needGib - win.models.freeGib, translator.language)))
+                    return lines.join("\n")
+                }
+            }
+            // How far the model's start is.
+            ProgressBar {
+                objectName: "loading"
+                Layout.alignment: Qt.AlignHCenter
+                Layout.preferredWidth: 240
+                visible: win.waiting && win.models.state === "starting" && win.models.loadSeconds > 0
+                value: win.loaded(win.now)
             }
 
             RowLayout {
@@ -540,7 +627,8 @@ ApplicationWindow {
                     objectName: "retry"
                     highlighted: true
                     visible: win.flow.error !== "" || win.blocked
-                    text: win.blocked ? qsTr("Stop %1 and start %2").arg(win.models.blockers.join(", ")).arg(win.models.name) : qsTr("Try again")
+                    text: !win.blocked || win.models.blockers.length === 0 ? qsTr("Try again")
+                        : qsTr("Stop %1 and play").arg(win.models.blockers.join(", "))
                     onClicked: win.again()
                 }
                 IconButton {
@@ -552,6 +640,36 @@ ApplicationWindow {
                     onClicked: win.flow.next()
                 }
             }
+        }
+
+        // The music model, and what it's doing: opens its sheet.
+        Label {
+            id: modelChip
+            objectName: "modelChip"
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 12
+            visible: win.usable
+            font.pixelSize: 12
+            color: chipHover.hovered ? theme.foreground : win.muted
+            text: {
+                const parts = [win.models.name]
+                const state = win.models.state
+                if (state === "ready" && win.models.heldGib > 0)
+                    parts.push(qsTr("using %1 GB").arg(win.gb(win.models.heldGib, translator.language)))
+                else if (state === "starting")
+                    parts.push(qsTr("loading…"))
+                else if (state === "installed" || state === "blocked")
+                    parts.push(qsTr("stopped"))
+                if (win.models.updatable)
+                    parts.push(qsTr("update ready"))
+                return parts.join("  ·  ")
+            }
+            HoverHandler { id: chipHover; cursorShape: Qt.PointingHandCursor }
+            TapHandler { onTapped: sheet.open() }
+            ToolTip.visible: chipHover.hovered
+            ToolTip.text: qsTr("Show the music model") + "  M"
+            ToolTip.delay: 300
         }
     }
 
@@ -583,6 +701,7 @@ ApplicationWindow {
                     { keys: "N", action: qsTr("Skip to the next tune") },
                     { keys: "G", action: qsTr("Pick another genre") },
                     { keys: "L", action: qsTr("Turn the lyrics on or off") },
+                    { keys: "M", action: qsTr("Show the music model") },
                     { keys: "?", action: qsTr("Show or hide the shortcuts") },
                     { keys: "Q", action: qsTr("Quit") }
                 ]
@@ -597,6 +716,245 @@ ApplicationWindow {
                         font.bold: true
                     }
                     Label { text: modelData.action }
+                }
+            }
+        }
+    }
+
+    // The music model: what it is and does, and what to do with it.
+    Popup {
+        id: sheet
+        objectName: "sheet"
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(win.width - 64, 480)
+        modal: true
+        focus: true
+        padding: 28
+        // Removing asks first, and asks again each time, and for whichever
+        // model the sheet shows by then.
+        property bool removing: false
+        readonly property string model: win.models.id
+        onModelChanged: removing = false
+        readonly property bool local: win.models.host === ""
+        readonly property bool running: ["ready", "starting"].includes(win.models.state)
+        readonly property bool setUp: ["ready", "starting", "installed", "blocked"].includes(win.models.state)
+        onAboutToShow: {
+            removing = false
+            win.models.checkMemory()
+        }
+        background: Rectangle {
+            color: theme.background
+            border.color: theme.colors.selection
+            radius: theme.radius
+        }
+
+        function stop() {
+            win.flow.stop()
+            win.models.stop()
+        }
+        function remove() {
+            if (!removing) {
+                removing = true
+                return
+            }
+            removing = false
+            win.flow.stop()
+            win.models.remove()
+        }
+        function use(id) {
+            win.flow.stop()
+            win.models.use(id)
+        }
+
+        // An open modal popup keeps the window's shortcuts from firing, so
+        // the sheet has its own.
+        Shortcut { sequence: "M"; enabled: sheet.opened; onActivated: sheet.close() }
+        Shortcut { sequence: "S"; enabled: sheet.opened && sheet.local && sheet.running && !win.models.working; onActivated: sheet.stop() }
+        Shortcut { sequence: "U"; enabled: sheet.opened && win.models.updatable && !win.models.updating && !win.models.working; onActivated: win.models.update() }
+        Shortcut { sequence: "Delete"; enabled: sheet.opened && sheet.local && sheet.setUp && !win.models.working; onActivated: sheet.remove() }
+        Shortcut { sequences: ["Return", "Enter"]; enabled: sheet.opened && sheet.removing; onActivated: sheet.remove() }
+
+        ColumnLayout {
+            width: parent.width
+            spacing: 10
+            LayoutMirroring.enabled: win.rightToLeft
+            LayoutMirroring.childrenInherit: true
+
+            Label {
+                Layout.fillWidth: true
+                // A Latin name keeps to the reading side in a right-to-left language too.
+                horizontalAlignment: Text.AlignLeft
+                wrapMode: Text.WordWrap
+                font.pixelSize: 22
+                font.weight: Font.DemiBold
+                text: win.models.name
+            }
+            Label {
+                objectName: "sheetState"
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: win.muted
+                text: {
+                    const language = translator.language
+                    switch (win.models.state) {
+                    case "ready":
+                        return !sheet.local ? qsTr("Running on %1, shared over your tailnet.").arg(win.models.host)
+                            : win.models.heldGib > 0 ? qsTr("Running, using %1 GB of memory.").arg(win.gb(win.models.heldGib, language))
+                            : qsTr("Running.")
+                    case "starting":
+                        return qsTr("Loading…")
+                    case "installed":
+                    case "blocked":
+                        return win.models.needGib > 0 ? qsTr("Stopped. It starts when you play, and needs %1 GB of memory.").arg(win.gb(win.models.needGib, language))
+                            : qsTr("Stopped. It starts when you play.")
+                    case "installing":
+                        return qsTr("Setting up…")
+                    case "removing":
+                        return qsTr("Removing…")
+                    case "installable":
+                        return win.models.diskGib > 0 ? qsTr("Not set up yet. It's a %1 GB download.").arg(win.gb(win.models.diskGib, language))
+                            : qsTr("Not set up yet.")
+                    }
+                    return ""
+                }
+            }
+            // The machine's memory, and who else holds some of it.
+            Label {
+                objectName: "sheetMemory"
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: win.muted
+                visible: text !== ""
+                text: {
+                    const language = translator.language
+                    const lines = []
+                    if (win.models.totalGib > 0 && win.models.freeGib >= 0)
+                        lines.push(qsTr("This machine has %1 GB of memory, and %2 GB is free.")
+                                   .arg(win.gb(win.models.totalGib, language)).arg(win.gb(win.models.freeGib, language)))
+                    if (win.models.holders.length > 0)
+                        lines.push(qsTr("Running now: %1").arg(win.holding(language)))
+                    return lines.join("\n")
+                }
+            }
+            ProgressBar {
+                Layout.fillWidth: true
+                visible: win.models.updating || win.models.state === "installing"
+                indeterminate: win.models.totalBytes <= 0 || win.models.phase !== "downloading"
+                value: win.models.totalBytes > 0 ? win.models.doneBytes / win.models.totalBytes : 0
+            }
+            Label {
+                objectName: "sheetUpdate"
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                visible: win.models.updatable && sheet.local
+                color: theme.accent
+                text: win.models.updating ? qsTr("Updating…")
+                    : win.models.updateBytes > 0 ? qsTr("An update is ready, a %1 GB download. The model restarts with it.").arg(win.gigabytes(win.models.updateBytes, translator.language))
+                    : qsTr("An update is ready. The model restarts with it.")
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                visible: text !== ""
+                color: theme.colors.red
+                text: win.models.error
+            }
+            Label {
+                objectName: "sheetRemoving"
+                Layout.fillWidth: true
+                Layout.topMargin: 6
+                wrapMode: Text.WordWrap
+                visible: sheet.removing
+                text: win.models.diskGib > 0
+                    ? qsTr("Remove %1? That frees about %2 GB of disk. Your tunes stay in your music folder.").arg(win.models.name).arg(win.gb(win.models.diskGib, translator.language))
+                    : qsTr("Remove %1? Your tunes stay in your music folder.").arg(win.models.name)
+            }
+            RowLayout {
+                Layout.topMargin: 6
+                spacing: 8
+                visible: sheet.local
+                FlowButton {
+                    objectName: "sheetUpdateButton"
+                    visible: win.models.updatable && !win.models.updating && !sheet.removing
+                    enabled: !win.models.working
+                    highlighted: true
+                    text: qsTr("Update")
+                    ToolTip.visible: hovered
+                    ToolTip.text: "U"
+                    onClicked: win.models.update()
+                }
+                FlowButton {
+                    objectName: "sheetStop"
+                    visible: sheet.running && !sheet.removing
+                    enabled: !win.models.working
+                    text: qsTr("Stop")
+                    ToolTip.visible: hovered
+                    ToolTip.text: "S"
+                    onClicked: sheet.stop()
+                }
+                FlowButton {
+                    objectName: "sheetSetUp"
+                    visible: win.models.state === "installable"
+                    enabled: !win.models.working
+                    highlighted: true
+                    text: qsTr("Set it up")
+                    onClicked: win.models.install()
+                }
+                FlowButton {
+                    objectName: "sheetRemove"
+                    visible: sheet.setUp
+                    enabled: !win.models.working
+                    highlighted: sheet.removing
+                    text: qsTr("Remove")
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Delete"
+                    onClicked: sheet.remove()
+                }
+                FlowButton {
+                    visible: sheet.removing
+                    text: qsTr("Keep it")
+                    onClicked: sheet.removing = false
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pixelSize: 12
+                color: win.muted
+                visible: sheet.local && sheet.running && !sheet.removing
+                text: qsTr("Stopping it frees its memory, and it starts again when you play.")
+            }
+
+            // Another music model to play with, where there's one.
+            Label {
+                Layout.topMargin: 12
+                visible: win.models.others.length > 0
+                font.weight: Font.DemiBold
+                text: qsTr("Other music models")
+            }
+            Repeater {
+                model: win.models.others
+                delegate: RowLayout {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: 12
+                    Label {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignLeft
+                        elide: Text.ElideRight
+                        text: modelData.name
+                    }
+                    Label {
+                        color: win.muted
+                        font.pixelSize: 12
+                        text: modelData.installed ? qsTr("Set up")
+                            : modelData.downloadGib > 0 ? qsTr("%1 GB download").arg(win.gb(modelData.downloadGib, translator.language)) : ""
+                    }
+                    FlowButton {
+                        enabled: !win.models.working
+                        text: qsTr("Use")
+                        onClicked: sheet.use(modelData.id)
+                    }
                 }
             }
         }
