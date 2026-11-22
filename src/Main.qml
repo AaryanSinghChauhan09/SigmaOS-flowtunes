@@ -730,8 +730,11 @@ ApplicationWindow {
         modal: true
         focus: true
         padding: 28
-        // Removing asks first, and asks again each time.
+        // Removing asks first, and asks again each time, and for whichever
+        // model the sheet shows by then.
         property bool removing: false
+        readonly property string model: win.models.id
+        onModelChanged: removing = false
         readonly property bool local: win.models.host === ""
         readonly property bool running: ["ready", "starting"].includes(win.models.state)
         readonly property bool setUp: ["ready", "starting", "installed", "blocked"].includes(win.models.state)
