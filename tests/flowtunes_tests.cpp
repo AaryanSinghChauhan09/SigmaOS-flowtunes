@@ -268,7 +268,7 @@ QByteArray tone() {
     return ffmpeg.readAllStandardOutput();
 }
 
-// A stand-in for omarchy-agent-local that notes what it was asked.
+// A stand-in for omarchy-models that notes what it was asked.
 QString fakeEngine(const QString &folder) {
     const QString path = folder + "/engine";
     // The refresh every start asks for is beside the point of any test.
