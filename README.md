@@ -1,4 +1,6 @@
-# Flowtunes
+# SigmaOS flowtunes
+
+> Forked from omacom/flowtunes (MIT). See `SIGMAOS_FORK.md`.
 
 Endless music in the genre you pick, made on your own machine with Omarchy's local music model.
 
