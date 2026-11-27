@@ -90,7 +90,7 @@
   "What do you want to flow to?": "อยากไหลไปกับเพลงแนวไหน",
   "Your tunes stay in your music folder.": "เพลงของคุณยังอยู่ในโฟลเดอร์เพลง",
   "loading…": "กำลังโหลด…",
-  "omarchy-models couldn't be run": "เรียกใช้ omarchy-models ไม่ได้",
+  "sigmaos-models couldn't be run": "เรียกใช้ sigmaos-models ไม่ได้",
   "stopped": "หยุดอยู่",
   "update ready": "มีอัปเดตพร้อม",
   "using %1 GB": "ใช้ %1 GB"

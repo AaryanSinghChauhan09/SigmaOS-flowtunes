@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Minkä tahdissa haluat päästä flow-tilaan?",
   "Your tunes stay in your music folder.": "Kappaleesi pysyvät musiikkikansiossa.",
   "loading…": "ladataan…",
-  "omarchy-models couldn't be run": "Komentoa omarchy-models ei voitu suorittaa",
+  "sigmaos-models couldn't be run": "Komentoa sigmaos-models ei voitu suorittaa",
   "stopped": "pysäytetty",
   "update ready": "päivitys valmiina",
   "using %1 GB": "käyttää %1 GB"

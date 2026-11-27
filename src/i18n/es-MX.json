@@ -90,7 +90,7 @@
   "What do you want to flow to?": "¿Con qué quieres fluir?",
   "Your tunes stay in your music folder.": "Tus temas se quedan en tu carpeta de música.",
   "loading…": "cargando…",
-  "omarchy-models couldn't be run": "No se pudo ejecutar omarchy-models",
+  "sigmaos-models couldn't be run": "No se pudo ejecutar sigmaos-models",
   "stopped": "detenido",
   "update ready": "actualización lista",
   "using %1 GB": "usa %1 GB"

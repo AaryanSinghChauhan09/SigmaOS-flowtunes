@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Під що хочете увійти в потік?",
   "Your tunes stay in your music folder.": "Ваші треки залишаться в папці з музикою.",
   "loading…": "завантаження…",
-  "omarchy-models couldn't be run": "Не вдалося запустити omarchy-models",
+  "sigmaos-models couldn't be run": "Не вдалося запустити sigmaos-models",
   "stopped": "зупинено",
   "update ready": "оновлення готове",
   "using %1 GB": "займає %1 GB"

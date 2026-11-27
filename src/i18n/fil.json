@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Anong tugtog ang gusto mong sabayan?",
   "Your tunes stay in your music folder.": "Mananatili ang mga tugtugin mo sa music folder mo.",
   "loading…": "nilo-load…",
-  "omarchy-models couldn't be run": "Hindi mapatakbo ang omarchy-models",
+  "sigmaos-models couldn't be run": "Hindi mapatakbo ang sigmaos-models",
   "stopped": "nakahinto",
   "update ready": "handa ang update",
   "using %1 GB": "gumagamit ng %1 GB"

@@ -24,9 +24,9 @@ bool isMusic(const QJsonObject &row) { return row.value("kind").toString() == "m
 Models::Models(const QString &stateDirectory, const QString &keyPath, const QString &command, const QString &meminfo,
                QObject *parent)
     : QObject(parent),
-      m_directory(!stateDirectory.isEmpty() ? stateDirectory : QDir::homePath() + "/.local/state/omarchy/agent-local"),
-      m_keyPath(!keyPath.isEmpty() ? keyPath : QDir::homePath() + "/.config/omarchy/agent-local/key"),
-      m_command(!command.isEmpty() ? command : QStandardPaths::findExecutable("omarchy-models")),
+      m_directory(!stateDirectory.isEmpty() ? stateDirectory : QDir::homePath() + "/.local/state/sigmaos/agent-local"),
+      m_keyPath(!keyPath.isEmpty() ? keyPath : QDir::homePath() + "/.config/sigmaos/agent-local/key"),
+      m_command(!command.isEmpty() ? command : QStandardPaths::findExecutable("sigmaos-models")),
       m_meminfo(!meminfo.isEmpty() ? meminfo : "/proc/meminfo") {
     // The engine replaces its files whole, which drops a file watch, so the
     // watch is armed again after every change.
@@ -54,7 +54,7 @@ Models::Models(const QString &stateDirectory, const QString &keyPath, const QStr
     connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         if (error != QProcess::FailedToStart)
             return;
-        m_error = tr("omarchy-models couldn't be run");
+        m_error = tr("sigmaos-models couldn't be run");
         m_queue.clear();
         emit changed();
     });
@@ -391,7 +391,7 @@ void Models::run(const QList<QStringList> &commands) {
         return;
     m_error.clear();
     if (m_command.isEmpty()) {
-        m_error = tr("omarchy-models couldn't be run");
+        m_error = tr("sigmaos-models couldn't be run");
         emit changed();
         return;
     }

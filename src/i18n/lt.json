@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Pagal kokią muziką norite pasinerti į srautą?",
   "Your tunes stay in your music folder.": "Jūsų kūriniai liks muzikos aplanke.",
   "loading…": "įkeliama…",
-  "omarchy-models couldn't be run": "Nepavyko paleisti omarchy-models",
+  "sigmaos-models couldn't be run": "Nepavyko paleisti sigmaos-models",
   "stopped": "sustabdytas",
   "update ready": "paruoštas atnaujinimas",
   "using %1 GB": "naudoja %1 GB"

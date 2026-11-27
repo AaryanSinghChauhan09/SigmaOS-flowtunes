@@ -90,7 +90,7 @@
   "What do you want to flow to?": "어떤 음악에 빠져들고 싶으세요?",
   "Your tunes stay in your music folder.": "곡은 음악 폴더에 그대로 남습니다.",
   "loading…": "불러오는 중…",
-  "omarchy-models couldn't be run": "omarchy-models을 실행할 수 없습니다",
+  "sigmaos-models couldn't be run": "sigmaos-models을 실행할 수 없습니다",
   "stopped": "중지됨",
   "update ready": "업데이트 준비됨",
   "using %1 GB": "%1 GB 사용 중"

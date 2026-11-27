@@ -20,10 +20,10 @@ struct ModelMemory {
     QHash<QString, double> held;
 };
 
-// The music model omarchy-local-ai runs for Flowtunes. It reads the engine's
+// The music model sigmaos-local-ai runs for Flowtunes. It reads the engine's
 // own status.json and list.json, follows their changes, weighs the model
 // against the memory that's free, and starts, stops, updates, removes or sets
-// up the model through omarchy-models.
+// up the model through sigmaos-models.
 class Models : public QObject {
     Q_OBJECT
     // noEngine, none, installable, installing, installed, blocked, starting, ready

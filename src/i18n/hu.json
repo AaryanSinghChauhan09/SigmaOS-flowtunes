@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Mire szeretnél ráhangolódni?",
   "Your tunes stay in your music folder.": "A számaid a zenei mappádban maradnak.",
   "loading…": "betöltés…",
-  "omarchy-models couldn't be run": "Az omarchy-models nem futtatható",
+  "sigmaos-models couldn't be run": "Az sigmaos-models nem futtatható",
   "stopped": "leállítva",
   "update ready": "frissítés kész",
   "using %1 GB": "%1 GB használatban"

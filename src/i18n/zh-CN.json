@@ -90,7 +90,7 @@
   "What do you want to flow to?": "想伴着什么音乐进入心流？",
   "Your tunes stay in your music folder.": "你的曲子会留在音乐文件夹中。",
   "loading…": "正在加载…",
-  "omarchy-models couldn't be run": "无法运行 omarchy-models",
+  "sigmaos-models couldn't be run": "无法运行 sigmaos-models",
   "stopped": "已停止",
   "update ready": "有可用更新",
   "using %1 GB": "占用 %1 GB"

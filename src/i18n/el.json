@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Με τι θέλετε να αφεθείτε στη ροή;",
   "Your tunes stay in your music folder.": "Τα κομμάτια σας μένουν στον φάκελο μουσικής.",
   "loading…": "φόρτωση…",
-  "omarchy-models couldn't be run": "Δεν ήταν δυνατή η εκτέλεση του omarchy-models",
+  "sigmaos-models couldn't be run": "Δεν ήταν δυνατή η εκτέλεση του sigmaos-models",
   "stopped": "σταματημένο",
   "update ready": "ενημέρωση έτοιμη",
   "using %1 GB": "χρησιμοποιεί %1 GB"

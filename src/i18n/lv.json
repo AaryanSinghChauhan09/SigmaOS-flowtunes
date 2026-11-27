@@ -90,7 +90,7 @@
   "What do you want to flow to?": "Kāda mūzika jūs ievedīs plūsmā?",
   "Your tunes stay in your music folder.": "Jūsu skaņdarbi paliks mūzikas mapē.",
   "loading…": "ielādē…",
-  "omarchy-models couldn't be run": "Neizdevās palaist omarchy-models",
+  "sigmaos-models couldn't be run": "Neizdevās palaist sigmaos-models",
   "stopped": "apturēts",
   "update ready": "gatavs atjauninājums",
   "using %1 GB": "izmanto %1 GB"
